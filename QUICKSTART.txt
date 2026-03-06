@@ -1,0 +1,127 @@
+# Scrcpy 远程控制系统 - 快速开始
+
+## 系统组成
+
+1. **中继服务器** (relay-server/) - 运行在服务器上的 Node.js 程序
+2. **控制台客户端** (scrcpy-console/) - 运行在家里 Windows 电脑上的程序
+3. **Web 界面** - 在浏览器中访问的远程控制界面
+
+## 使用步骤
+
+### 步骤 1: 启动中继服务器
+
+在服务器上执行:
+
+```bash
+cd relay-server
+npm install
+node server.js
+```
+
+或使用快捷脚本:
+- Windows: `start-relay-server.bat`
+- Linux/Mac: `./start-relay-server.sh`
+
+服务器将在 8080 端口启动。
+
+### 步骤 2: 编译并运行控制台客户端
+
+在家里的 Windows 电脑上:
+
+```batch
+cd scrcpy-console
+build.bat          # 编译程序
+run.bat            # 运行程序
+```
+
+或直接运行:
+```batch
+scrcpy-console.exe [服务器IP:端口]
+例如: scrcpy-console.exe 192.168.1.100:8080
+```
+
+### 步骤 3: 访问 Web 界面
+
+在任何电脑的浏览器中打开:
+```
+http://[服务器IP]:8080
+```
+
+## 工作原理
+
+1. **控制台客户端** 自动检测 ADB 设备并上报到服务器
+2. **中继服务器** 管理所有控制台和设备信息
+3. **Web 界面** 显示所有可用设备，选择后可远程查看和控制
+
+## 目录结构
+
+```
+scrcpy/
+├── relay-server/           # 中继服务器
+│   ├── server.js           # 服务器主程序
+│   ├── package.json        # 依赖配置
+│   └── public/             # Web 前端
+│       ├── index.html      # 主页面
+│       └── app.js          # 前端逻辑
+│
+├── scrcpy-console/         # Windows 控制台客户端
+│   ├── scrcpy_console.c    # C 语言源码
+│   ├── build.bat           # 编译脚本
+│   └── run.bat             # 运行脚本
+│
+└── app/src/                # scrcpy 源码扩展
+    ├── websocket_sink.h    # WebSocket 模块
+    └── websocket_sink.c
+```
+
+## 控制台输出说明
+
+控制台会显示彩色日志:
+- **绿色 [SUCCESS]**: 成功信息
+- **黄色 [WARNING]**: 警告信息  
+- **红色 [ERROR]**: 错误信息
+- **白色 [INFO]**: 一般信息
+
+示例输出:
+```
+========================================
+  Scrcpy Console Client v1.0.0
+  远程控制客户端
+========================================
+
+[10:30:15] [INFO] 服务器地址: 192.168.1.100:8080
+[10:30:15] [SUCCESS] 已连接到中继服务器
+[10:30:16] [INFO] 正在扫描 ADB 设备...
+[10:30:16] [INFO]   [1] 192.168.1.50:5555 - device (Redmi_Note_8)
+[10:30:16] [INFO]   [2] emulator-5554 - device (Android_Emulator)
+[10:30:16] [INFO] 检测到 2 个 ADB 设备
+[10:30:16] [INFO] 已发送设备列表到服务器
+[10:30:16] [SUCCESS] 客户端 ID: console_1732012345_abc123
+[10:30:16] [INFO] 进入主循环，等待服务器消息...
+```
+
+## 常见问题
+
+### 1. 控制台连接失败
+- 检查服务器地址和端口是否正确
+- 确保服务器防火墙开放了 8080 端口
+- 检查网络连接
+
+### 2. 检测不到 ADB 设备
+- 确保 adb.exe 在 PATH 环境变量中
+- 运行 `adb devices` 检查设备是否连接
+- 检查 USB 调试是否开启
+
+### 3. Web 界面无法连接
+- 刷新页面重试
+- 检查浏览器控制台错误
+- 确保使用支持 WebSocket 的浏览器
+
+## 技术特性
+
+- ✅ 自动检测 ADB 设备
+- ✅ 实时上报设备列表
+- ✅ WebSocket 双向通信
+- ✅ 多控制台支持
+- ✅ 彩色日志输出
+- ✅ 自动重连机制

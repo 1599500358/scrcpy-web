@@ -1,0 +1,1111 @@
+const express = require('express');
+const WebSocket = require('ws');
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const AuthManager = require('./auth-manager');
+
+// 日志级别控制
+const LOG_LEVELS = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
+const CURRENT_LOG_LEVEL = LOG_LEVELS[process.env.LOG_LEVEL || 'INFO'];
+function log(level, ...args) {
+    if (LOG_LEVELS[level] <= CURRENT_LOG_LEVEL) {
+        const prefix = `[${new Date().toISOString()}] [${level}]`;
+        if (level === 'ERROR') console.error(prefix, ...args);
+        else if (level === 'WARN') console.warn(prefix, ...args);
+        else console.log(prefix, ...args);
+    }
+}
+
+const app = express();
+const authManager = new AuthManager(path.join(__dirname, 'auth-config.json'));
+
+const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 8 * 1024 * 1024);
+const ENABLE_VIDEO_LOG = process.env.ENABLE_VIDEO_LOG === 'true';
+const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 300000); // 默认5分钟空闲超时（毫秒）
+
+// 双模式配置：同时支持 HTTP 和 HTTPS
+const HTTP_PORT = process.env.HTTP_PORT || 8080;  // 本地 scrcpy 使用
+const HTTPS_PORT = process.env.HTTPS_PORT || 8443; // 远程 Web 使用
+const ENABLE_HTTPS = process.env.ENABLE_HTTPS === 'true' || false;
+
+// 创建 HTTP 服务器（总是启用）
+const httpServer = http.createServer(app);
+httpServer.on('connection', (socket) => {
+    socket.setNoDelay(true);
+});
+const httpWss = new WebSocket.Server({ server: httpServer, perMessageDeflate: false });
+
+// HTTPS 服务器（可选）
+let httpsServer = null;
+let httpsWss = null;
+
+if (ENABLE_HTTPS) {
+    const certPath = process.env.SSL_CERT_PATH || path.join(__dirname, 'cert', 'server.crt');
+    const keyPath = process.env.SSL_KEY_PATH || path.join(__dirname, 'cert', 'server.key');
+    
+    if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+        const httpsOptions = {
+            cert: fs.readFileSync(certPath),
+            key: fs.readFileSync(keyPath)
+        };
+        httpsServer = https.createServer(httpsOptions, app);
+        httpsServer.on('connection', (socket) => {
+            socket.setNoDelay(true);
+        });
+        httpsWss = new WebSocket.Server({ server: httpsServer, perMessageDeflate: false });
+        log('INFO', '[HTTPS] SSL 证书已加载');
+    } else {
+        log('ERROR', '[HTTPS] SSL 证书文件不存在，请先生成证书');
+        log('ERROR', `  证书路径: ${certPath}`);
+        log('ERROR', `  密钥路径: ${keyPath}`);
+        log('ERROR', '  运行: node generate-cert.js');
+        process.exit(1);
+    }
+}
+
+// 存储控制台客户端（家里的 Windows 电脑）
+const consoleClients = new Map(); // clientId -> { ws, devices: Map }
+
+// 存储 Web 浏览器客户端
+const webClients = new Map(); // clientId -> { ws, currentDevice }
+
+// 存储控制台预注册的设备推流（允许控制台启动的scrcpy连接）
+const pendingDeviceStreams = new Map(); // serial -> consoleId
+
+// 添加设备别名存储
+const deviceAliases = new Map();
+
+// 加载设备别名
+function loadDeviceAliases() {
+    try {
+        if (fs.existsSync('device_aliases.json')) {
+            const data = fs.readFileSync('device_aliases.json', 'utf8');
+            const aliases = JSON.parse(data);
+            for (const [key, value] of Object.entries(aliases)) {
+                deviceAliases.set(key, value);
+            }
+            console.log(`[设备别名] 已加载 ${deviceAliases.size} 个设备别名`);
+        }
+    } catch (err) {
+        console.error('[设备别名] 加载设备别名失败:', err);
+    }
+}
+
+// 保存设备别名（带 debounce，避免频繁写文件）
+let _saveAliasesTimer = null;
+function saveDeviceAliases() {
+    if (_saveAliasesTimer) clearTimeout(_saveAliasesTimer);
+    _saveAliasesTimer = setTimeout(() => {
+        try {
+            const aliases = {};
+            deviceAliases.forEach((value, key) => {
+                aliases[key] = value;
+            });
+            fs.writeFileSync('device_aliases.json', JSON.stringify(aliases, null, 2));
+            log('INFO', '[设备别名] 设备别名已保存');
+        } catch (err) {
+            log('ERROR', '[设备别名] 保存设备别名失败:', err);
+        }
+    }, 1000); // 1秒内的多次修改合并为一次写入
+}
+
+// 初始化时加载设备别名
+loadDeviceAliases();
+
+// 配置会话中间件
+const sessionConfig = authManager.getSessionConfig();
+// 根据是否启用HTTPS动态设置cookie安全属性
+sessionConfig.cookie.secure = ENABLE_HTTPS;
+sessionConfig.cookie.httpOnly = true; // 防止XSS窃取session cookie
+sessionConfig.name = 'scrcpy.sid'; // 设置会话cookie名称
+sessionConfig.saveUninitialized = true; // 确保会话被保存
+sessionConfig.resave = false;
+// session secret 优先从环境变量读取
+if (process.env.SESSION_SECRET) {
+    sessionConfig.secret = process.env.SESSION_SECRET;
+} else if (!sessionConfig.secret || sessionConfig.secret.includes('change-this')) {
+    // 没有设置环境变量且配置文件使用默认值时，自动生成随机密钥
+    sessionConfig.secret = crypto.randomBytes(32).toString('hex');
+    log('WARN', '[安全] 使用自动生成的session secret，建议设置 SESSION_SECRET 环境变量');
+}
+const sessionMiddleware = session(sessionConfig);
+app.use(sessionMiddleware);
+
+// 解析请求体
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// 认证检查中间件
+function checkAuth(req, res, next) {
+    if (req.session && req.session.user) {
+        next();
+    } else {
+        if (req.path === '/login' || req.path === '/api/login') {
+            next();
+        } else {
+            res.redirect('/login');
+        }
+    }
+}
+
+// 登录页面路由
+app.get('/login', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// 登录API
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: '请提供用户名和密码' });
+    }
+    
+    try {
+        const result = await authManager.authenticate(username, password);
+        if (result.success) {
+            req.session.user = result.user;
+            req.session.loginTime = new Date().toISOString();
+            
+            // 显式保存会话
+            req.session.save((err) => {
+                if (err) {
+                    log('ERROR', '会话保存错误:', err);
+                    return res.status(500).json({ success: false, message: '会话保存失败' });
+                }
+                log('INFO', '会话已保存，用户:', result.user.username);
+                log('INFO', '登录会话ID:', req.sessionID);
+                res.json({ success: true, message: '登录成功' });
+            });
+        } else {
+            res.status(401).json(result);
+        }
+    } catch (error) {
+        log('ERROR', '登录错误:', error);
+        res.status(500).json({ success: false, message: '服务器错误' });
+    }
+});
+
+// 登出API
+app.post('/api/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            log('ERROR', '登出错误:', err);
+            res.status(500).json({ success: false, message: '登出失败' });
+        } else {
+            res.json({ success: true, message: '登出成功' });
+        }
+    });
+});
+
+// 获取当前用户信息
+app.get('/api/user', authManager.requireAuth, (req, res) => {
+    res.json({ user: req.session.user });
+});
+
+// 受保护的静态文件服务
+app.use('/static', express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 主页路由（需要认证）
+app.get('/', checkAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// API: 控制台预注册设备推流（需要验证控制台身份）
+app.post('/api/prepare-device-stream', (req, res) => {
+    const { serial, consoleId } = req.body;
+    
+    if (!serial || !consoleId) {
+        return res.status(400).json({ 
+            success: false, 
+            message: '缺少参数: serial 和 consoleId 是必需的' 
+        });
+    }
+    
+    // 验证控制台是否存在
+    if (!consoleClients.has(consoleId)) {
+        return res.status(404).json({ 
+            success: false, 
+            message: '控制台不存在' 
+        });
+    }
+    
+    // 验证请求来源IP是否与控制台连接IP一致
+    const consoleClient = consoleClients.get(consoleId);
+    const requestIp = req.ip || req.connection.remoteAddress;
+    const consoleIp = consoleClient.remoteAddress;
+    if (consoleIp && requestIp && !requestIp.includes('127.0.0.1') && !requestIp.includes('::1') && requestIp !== consoleIp) {
+        log('WARN', `[预注册] IP不匹配: 请求=${requestIp}, 控制台=${consoleIp}`);
+        return res.status(403).json({
+            success: false,
+            message: '来源验证失败'
+        });
+    }
+    
+    // 预注册设备推流
+    pendingDeviceStreams.set(serial, consoleId);
+    log('INFO', `[预注册] 控制台${consoleId}预注册设备${serial}的推流`);
+    
+    res.json({ 
+        success: true, 
+        message: '设备推流已预注册' 
+    });
+});
+
+// API: 获取所有可用设备列表（需要认证）
+app.get('/api/devices', authManager.requireAuth, (req, res) => {
+    const allDevices = [];
+    consoleClients.forEach((client, clientId) => {
+        client.devices.forEach((device, serial) => {
+            allDevices.push({
+                ...device,
+                consoleId: clientId
+            });
+        });
+    });
+    res.json(allDevices);
+});
+
+// 辅助函数：查找设备（支持 IP 地址模糊匹配）
+function findDeviceBySerial(serial) {
+    let foundDevice = null;
+    let foundConsoleId = null;
+    let matchedSerial = null;
+    
+    consoleClients.forEach((consoleClient, consoleId) => {
+        // 先尝试精确匹配
+        if (consoleClient.devices.has(serial)) {
+            foundDevice = consoleClient.devices.get(serial);
+            foundConsoleId = consoleId;
+            matchedSerial = serial;
+            return;
+        }
+        
+        // 如果是 IP 地址，尝试模糊匹配（支持无线调试）
+        // 例如：scrcpy 发送 "192.168.0.6"，控制台有 "192.168.0.6:39743"
+        if (serial && serial.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+            consoleClient.devices.forEach((device, deviceSerial) => {
+                if (deviceSerial.startsWith(serial + ':')) {
+                    foundDevice = device;
+                    foundConsoleId = consoleId;
+                    matchedSerial = deviceSerial;
+                }
+            });
+        }
+    });
+    
+    return { device: foundDevice, consoleId: foundConsoleId, serial: matchedSerial };
+}
+
+// 辅助函数：拆分设备 ID（支持带端口的 IP 地址）
+// 例："console_xxx:192.168.0.6:39743" -> ["console_xxx", "192.168.0.6:39743"]
+function splitDeviceId(deviceId) {
+    const colonIndex = deviceId.indexOf(':');
+    if (colonIndex === -1) {
+        return [deviceId, ''];
+    }
+    return [
+        deviceId.substring(0, colonIndex),
+        deviceId.substring(colonIndex + 1)
+    ];
+}
+
+// WebSocket 连接处理函数（共用）
+function handleWebSocketConnection(ws, req) {
+    const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
+    const clientType = params.get('type'); // 'console', 'scrcpy' 或 'web'
+    const serial = params.get('serial');
+    
+    // 为 WebSocket upgrade 请求创建模拟 response 对象
+    // express-session 需要 res 上有 writeHead/end/on 等方法
+    const fakeRes = {
+        writeHead: () => {},
+        end: () => {},
+        on: () => {},
+        getHeader: () => {},
+        setHeader: () => {}
+    };
+    
+    // 检查WebSocket连接是否需要认证
+    if (clientType === 'web') {
+        // Web客户端始终需要认证
+        log('INFO', `[认证] WebSocket upgrade cookies: ${req.headers.cookie || '(none)'}`);
+        sessionMiddleware(req, fakeRes, () => {
+            log('INFO', `[认证] session解析完成, sessionID: ${req.sessionID}, hasUser: ${!!(req.session && req.session.user)}, keys: ${req.session ? Object.keys(req.session).join(',') : 'null'}`);
+            if (req.session && req.session.user) {
+                log('INFO', `[认证] WebSocket连接已授权: ${req.session.user.username}`);
+                // 继续处理WebSocket连接
+                continueWebSocketConnection(ws, req, params, clientType, req.session.user);
+            } else {
+                log('WARN', `[认证] WebSocket连接被拒绝: 无效会话`);
+                ws.close(1008, '未授权访问');
+            }
+        });
+    } else if (clientType === 'scrcpy' && serial) {
+        // scrcpy连接：检查是否是控制台预注册的设备
+        if (pendingDeviceStreams.has(serial)) {
+            const consoleId = pendingDeviceStreams.get(serial);
+            log('INFO', `[认证] scrcpy连接已授权: 设备${serial}由控制台${consoleId}预注册`);
+            pendingDeviceStreams.delete(serial); // 使用一次后删除
+            continueWebSocketConnection(ws, req, params, clientType, null);
+        } else {
+            // 未预注册的设备需要认证
+            sessionMiddleware(req, fakeRes, () => {
+                if (req.session && req.session.user) {
+                    log('INFO', `[认证] scrcpy连接已授权: ${req.session.user.username}`);
+                    continueWebSocketConnection(ws, req, params, clientType, req.session.user);
+                } else {
+                    log('WARN', `[认证] scrcpy连接被拒绝: 无效会话`);
+                    ws.close(1008, '未授权访问');
+                }
+            });
+        }
+    } else {
+        // 控制台连接不需要认证
+        continueWebSocketConnection(ws, req, params, clientType, null);
+    }
+}
+
+// 继续WebSocket连接处理
+function continueWebSocketConnection(ws, req, params, clientType, user) {
+    
+    log('INFO', `[连接] 新连接: type=${clientType}`);
+    
+    if (clientType === 'console') {
+        // Windows 控制台客户端连接
+        const clientId = `console_${crypto.randomUUID()}`;
+        consoleClients.set(clientId, {
+            ws,
+            devices: new Map(),
+            connectedAt: new Date().toISOString(),
+            remoteAddress: req.socket.remoteAddress // 保存连接IP用于认证
+        });
+        
+        log('INFO', `[控制台] 已注册: ${clientId}`);
+        
+        // 发送欢迎消息，包含控制台ID
+        ws.send(JSON.stringify({
+            type: 'welcome',
+            clientId: clientId,
+            message: '已连接到中继服务器'
+        }));
+        
+        ws.on('message', (data) => {
+            try {
+                const msg = JSON.parse(data);
+                handleConsoleMessage(clientId, msg);
+            } catch (e) {
+                log('ERROR', '[控制台] 消息解析错误:', e);
+            }
+        });
+        
+        ws.on('close', () => {
+            consoleClients.delete(clientId);
+            log('INFO', `[控制台] 已断开: ${clientId}`);
+            broadcastDeviceListToWeb();
+        });
+        
+    } else if (clientType === 'scrcpy') {
+        // scrcpy 视频连接
+        const serial = params.get('serial');
+        
+        if (!serial) {
+            log('WARN', '[scrcpy-video] 连接被拒绝: 缺少 serial');
+            ws.close();
+            return;
+        }
+        
+        log('INFO', `[scrcpy-video] 设备 ${serial} 视频流已连接`);
+        
+        // 使用辅助函数查找设备（支持 IP 地址模糊匹配）
+        const result = findDeviceBySerial(serial);
+        let foundDevice = result.device;
+        let foundConsoleId = result.consoleId;
+        const matchedSerial = result.serial;
+        
+        // 构建此设备的查找键（用于视频转发索引）
+        const deviceKey = foundConsoleId && matchedSerial ? `${foundConsoleId}:${matchedSerial}` : null;
+        
+        if (foundDevice) {
+            foundDevice.videoWs = ws; // 保存视频 WebSocket 连接
+            foundDevice.status = 'streaming';
+            foundDevice.viewerCount = 0; // 初始化观看者数量
+            foundDevice.lastActivityTime = Date.now(); // 初始化最后活动时间
+            foundDevice.deviceKey = deviceKey; // 保存索引键
+            
+            log('INFO', `[scrcpy-video] 找到设备所属控制台: ${foundConsoleId}, 匹配序列号: ${matchedSerial}`);
+            
+            // 通知控制台
+            const consoleClient = consoleClients.get(foundConsoleId);
+            if (consoleClient) {
+                consoleClient.ws.send(JSON.stringify({
+                    type: 'deviceStreamingStarted',
+                    serial: matchedSerial
+                }));
+            }
+        } else {
+            log('WARN', `[scrcpy-video] 警告: 设备 ${serial} 不在任何控制台的设备列表中`);
+        }
+        
+        // 接收并转发视频数据（透明转发，不修改数据）
+        ws.on('message', (data) => {
+            if (Buffer.isBuffer(data) && foundDevice) {
+                // 更新设备最后活动时间
+                foundDevice.lastActivityTime = Date.now();
+                
+                // 使用观看者索引快速查找（O(1) 而非遍历所有客户端）
+                const viewers = deviceKey ? deviceViewerIndex.get(deviceKey) : null;
+                let viewerCount = 0;
+                if (viewers && viewers.size > 0) {
+                    for (const viewerWs of viewers) {
+                        if (viewerWs.readyState === WebSocket.OPEN) {
+                            if (viewerWs.bufferedAmount <= MAX_WS_BUFFERED_AMOUNT) {
+                                viewerWs.send(data, { binary: true, compress: false });
+                                viewerCount++;
+                            }
+                        }
+                    }
+                } else {
+                    // 降级：索引中找不到时遍历（兼容旧匹配方式）
+                    webClients.forEach((client) => {
+                        const matchDevice = client.currentDevice === `${foundConsoleId}:${matchedSerial}` || 
+                                           client.currentDevice === `${foundConsoleId}:${serial}` ||
+                                           client.currentDevice === matchedSerial ||
+                                           client.currentDevice === serial;
+                        if (matchDevice && client.ws.readyState === WebSocket.OPEN) {
+                            if (client.ws.bufferedAmount <= MAX_WS_BUFFERED_AMOUNT) {
+                                client.ws.send(data, { binary: true, compress: false });
+                                viewerCount++;
+                            }
+                        }
+                    });
+                }
+                
+                // 更新观看者数量
+                foundDevice.viewerCount = viewerCount;
+            }
+        });
+        ws.on('error', (err) => {
+            log('ERROR', `[scrcpy-video] 设备 ${serial} 连接错误:`, err);
+        });
+        
+        ws.on('close', (code, reason) => {
+            if (foundDevice) {
+                foundDevice.videoWs = null;
+                foundDevice.status = 'ready';
+                log('INFO', `[scrcpy-video] 设备 ${serial} 视频流已断开，code=${code} reason=${reason}`);
+                broadcastDeviceListToWeb();
+            }
+        });
+        
+    } else if (clientType === 'control') {
+        // scrcpy 控制连接
+        const serial = params.get('serial');
+        
+        if (!serial) {
+            log('WARN', '[scrcpy-control] 连接被拒绝: 缺少 serial');
+            ws.close();
+            return;
+        }
+        
+        log('INFO', `[scrcpy-control] 设备 ${serial} 控制连接已建立`);
+        
+        // 使用辅助函数查找设备（支持 IP 地址模糊匹配）
+        const result = findDeviceBySerial(serial);
+        let foundDevice = result.device;
+        let foundConsoleId = result.consoleId;
+        const matchedSerial = result.serial;
+        
+        if (foundDevice) {
+            foundDevice.controlWs = ws; // 保存控制 WebSocket 连接
+            log('INFO', `[scrcpy-control] 找到设备所属控制台: ${foundConsoleId}, 匹配序列号: ${matchedSerial}`);
+        } else {
+            log('WARN', `[scrcpy-control] 警告: 设备 ${serial} 不在任何控制台的设备列表中`);
+        }
+        
+        // 不需要接收数据，只用于发送控制消息
+        
+        ws.on('close', (code, reason) => {
+            if (foundDevice) {
+                foundDevice.controlWs = null;
+                log('INFO', `[scrcpy-control] 设备 ${serial} 控制连接已断开，code=${code} reason=${reason}`);
+            }
+        });
+        
+    } else if (clientType === 'device') {
+        // scrcpy 设备视频流连接
+        const serial = params.get('serial');
+        const consoleId = params.get('consoleId');
+        
+        if (!serial || !consoleId) {
+            log('WARN', '[设备] 连接被拒绝: 缺少 serial 或 consoleId');
+            ws.close();
+            return;
+        }
+        
+        const consoleClient = consoleClients.get(consoleId);
+        if (!consoleClient) {
+            log('WARN', `[设备] 连接被拒绝: 控制台 ${consoleId} 不存在`);
+            ws.close();
+            return;
+        }
+        
+        const device = consoleClient.devices.get(serial);
+        if (device) {
+            device.videoWs = ws;
+            device.status = 'streaming';
+            log('INFO', `[设备] ${serial} 视频流已连接`);
+            
+            // 通知控制台
+            consoleClient.ws.send(JSON.stringify({
+                type: 'deviceStreamingStarted',
+                serial: serial
+            }));
+        }
+        
+        ws.on('message', (data) => {
+            webClients.forEach((client) => {
+                if (client.currentDevice === `${consoleId}:${serial}` && 
+                    client.ws.readyState === WebSocket.OPEN) {
+                    if (client.ws.bufferedAmount <= MAX_WS_BUFFERED_AMOUNT) {
+                        client.ws.send(data, { binary: true, compress: false });
+                    }
+                }
+            });
+        });
+        
+        ws.on('close', () => {
+            if (device) {
+                device.videoWs = null;
+                device.status = 'ready';
+                log('INFO', `[设备] ${serial} 视频流已断开`);
+            }
+        });
+        
+    } else if (clientType === 'web') {
+        // Web 浏览器客户端连接
+        const clientId = `web_${crypto.randomUUID()}`;
+        webClients.set(clientId, {
+            ws,
+            currentDevice: null
+        });
+        
+        log('INFO', `[Web客户端] 已连接: ${clientId}`);
+        
+        // 发送当前可用设备列表
+        sendDeviceListToWeb(ws);
+        
+        ws.on('message', (message) => {
+            try {
+                const msg = JSON.parse(message);
+                handleWebMessage(clientId, msg);
+            } catch (e) {
+                log('ERROR', '[Web客户端] 消息解析错误:', e);
+            }
+        });
+        
+        ws.on('close', () => {
+            // 如果该客户端正在观看设备，从观看者索引中移除并更新计数
+            const webClient = webClients.get(clientId);
+            if (webClient && webClient.currentDevice) {
+                removeViewerFromIndex(webClient.currentDevice, webClient.ws);
+                const [consoleId, serial] = splitDeviceId(webClient.currentDevice);
+                const consoleClient = consoleClients.get(consoleId);
+                if (consoleClient) {
+                    const device = consoleClient.devices.get(serial);
+                    if (device && device.viewerCount > 0) {
+                        device.viewerCount--;
+                        log('INFO', `[Web客户端] ${clientId} 断开，设备 ${serial} 剩余观看者: ${device.viewerCount}`);
+                    }
+                }
+            }
+            
+            webClients.delete(clientId);
+            log('INFO', `[Web客户端] 已断开: ${clientId}`);
+        });
+    }
+}
+
+// 应用 WebSocket 处理到 HTTP 服务器
+httpWss.on('connection', handleWebSocketConnection);
+
+// 如果启用了 HTTPS，也应用到 HTTPS 服务器
+if (ENABLE_HTTPS && httpsWss) {
+    httpsWss.on('connection', handleWebSocketConnection);
+}
+
+// 处理控制台消息
+function handleConsoleMessage(consoleId, msg) {
+    const consoleClient = consoleClients.get(consoleId);
+    if (!consoleClient) return;
+    
+    switch (msg.type) {
+        case 'deviceList':
+            // 更新设备列表
+            const oldDevices = consoleClient.devices;
+            consoleClient.devices = new Map();
+            
+            msg.devices.forEach(device => {
+                const oldDevice = oldDevices.get(device.serial);
+                // 保留所有设备属性，包括thumbnail和customName
+                consoleClient.devices.set(device.serial, {
+                    ...device,
+                    consoleId: consoleId,
+                    videoWs: oldDevice?.videoWs || null,
+                    controlWs: oldDevice?.controlWs || null, // 也保留控制连接
+                    status: oldDevice?.status || 'ready',
+                    viewerCount: oldDevice?.viewerCount || 0, // 保留观看者计数
+                    lastActivityTime: oldDevice?.lastActivityTime || Date.now() // 保留最后活动时间
+                });
+                
+                // 添加调试信息
+                log('DEBUG', `[控制台] 设备 ${device.serial} 缩略图数据长度: ${device.thumbnail ? device.thumbnail.length : 0}`);
+            });
+            
+            log('INFO', `[控制台] ${consoleId} 更新了设备列表: ${msg.devices.length} 个设备`);
+            broadcastDeviceListToWeb();
+            break;
+            
+        case 'deviceUpdate':
+            // 更新单个设备信息
+            if (msg.device) {
+                const device = msg.device;
+                const oldDevice = consoleClient.devices.get(device.serial);
+                
+                // 更新或添加设备信息
+                consoleClient.devices.set(device.serial, {
+                    ...device,
+                    consoleId: consoleId,
+                    videoWs: oldDevice?.videoWs || null,
+                    controlWs: oldDevice?.controlWs || null,
+                    status: oldDevice?.status || 'ready',
+                    viewerCount: oldDevice?.viewerCount || 0,
+                    lastActivityTime: oldDevice?.lastActivityTime || Date.now()
+                });
+                
+                log('INFO', `[控制台] ${consoleId} 更新了设备 ${device.serial} 信息`);
+                log('DEBUG', `[控制台] 设备 ${device.serial} 缩略图数据长度: ${device.thumbnail ? device.thumbnail.length : 0}`);
+                
+                // 广播更新到所有Web客户端
+                broadcastDeviceUpdateToWeb(device);
+            }
+            break;
+            
+        case 'log':
+            log('INFO', `[控制台日志] [${consoleId}] ${msg.message}`);
+            break;
+            
+        case 'startStreaming':
+            // 控制台准备开始推流
+            const device = consoleClient.devices.get(msg.serial);
+            if (device) {
+                device.status = 'starting';
+                log('INFO', `[控制台] ${consoleId} 开始推流设备 ${msg.serial}`);
+            }
+            break;
+            
+        case 'prepareStream':
+            // 控制台预注册设备推流（新的处理方式）
+            const prepareSerial = msg.serial;
+            if (prepareSerial) {
+                pendingDeviceStreams.set(prepareSerial, consoleId);
+                log('INFO', `[控制台] ${consoleId} 预注册设备推流: ${prepareSerial}`);
+                
+                // 回复确认
+                consoleClient.ws.send(JSON.stringify({
+                    type: 'prepareStreamResponse',
+                    serial: prepareSerial,
+                    success: true
+                }));
+            }
+            break;
+            
+        default:
+            log('WARN', `[控制台] 未知消息类型: ${msg.type}`);
+            break;
+    }
+}
+
+// 处理 Web 客户端消息
+function handleWebMessage(clientId, msg) {
+    const webClient = webClients.get(clientId);
+    if (!webClient) return;
+    
+    switch (msg.type) {
+        case 'selectDevice':
+            // 先从旧设备索引中移除
+            if (webClient.currentDevice) {
+                removeViewerFromIndex(webClient.currentDevice, webClient.ws);
+            }
+            
+            webClient.currentDevice = msg.deviceId;
+            log('INFO', `[Web客户端] ${clientId} 选择了设备 ${msg.deviceId}`);
+            
+            // 添加到观看者索引
+            addViewerToIndex(msg.deviceId, webClient.ws);
+            
+            // 查找设备并发送缓存的关键帧（如果有）
+            const [consoleId, serial] = splitDeviceId(msg.deviceId);
+            log('DEBUG', `[Web客户端] 解析设备ID: consoleId=${consoleId}, serial=${serial}`);
+            
+            const consoleClient = consoleClients.get(consoleId);
+            if (consoleClient) {
+                log('DEBUG', `[Web客户端] 找到控制台客户端: ${consoleId}`);
+                // 通知控制台启动该设备的推流
+                if (consoleClient.ws.readyState === WebSocket.OPEN) {
+                    consoleClient.ws.send(JSON.stringify({
+                        type: 'startDevice',
+                        serial: serial
+                    }));
+                    log('INFO', `[Web客户端] 已发送startDevice消息到控制台: ${consoleId}`);
+                } else {
+                    log('WARN', `[Web客户端] 控制台连接状态异常: ${consoleClient.ws.readyState}`);
+                }
+            } else {
+                log('WARN', `[Web客户端] 未找到控制台客户端: ${consoleId}`);
+                log('DEBUG', `[Web客户端] 当前可用的控制台客户端:`, Array.from(consoleClients.keys()));
+            }
+            break;
+            
+        case 'touch':
+            // 触摸事件，发送给 scrcpy 的控制 WebSocket
+            if (webClient.currentDevice) {
+                const [consoleId, serial] = splitDeviceId(webClient.currentDevice);
+                
+                // 查找 scrcpy 的控制 WebSocket 连接
+                const consoleClient = consoleClients.get(consoleId);
+                if (consoleClient) {
+                    const device = consoleClient.devices.get(serial);
+                    if (device && device.controlWs && device.controlWs.readyState === WebSocket.OPEN) {
+                        // 发送触摸事件
+                        const touchMsg = {
+                            type: 'touch',
+                            action: 'touch',  // 总动作类型
+                            touchType: msg.action,  // down/move/up
+                            x: msg.x,
+                            y: msg.y,
+                            width: msg.width,
+                            height: msg.height
+                        };
+                        
+                        device.controlWs.send(JSON.stringify(touchMsg));
+                        log('DEBUG', `[Web客户端] ${clientId} 发送触摸: ${msg.action} at (${msg.x}, ${msg.y})`);
+                    } else {
+                        log('WARN', `[Web客户端] ${clientId} 设备 ${serial} 控制连接不可用`);
+                    }
+                }
+            }
+            break;
+            
+        case 'control':
+            // 控制按钮（Home/Back等）
+            if (webClient.currentDevice) {
+                const [consoleId, serial] = splitDeviceId(webClient.currentDevice);
+                
+                const consoleClient = consoleClients.get(consoleId);
+                if (consoleClient) {
+                    const device = consoleClient.devices.get(serial);
+                    if (device && device.controlWs && device.controlWs.readyState === WebSocket.OPEN) {
+                        const controlMsg = {
+                            type: 'control',
+                            action: msg.action
+                        };
+                        
+                        device.controlWs.send(JSON.stringify(controlMsg));
+                        log('INFO', `[Web客户端] ${clientId} 发送控制: ${msg.action}`);
+                    }
+                }
+            }
+            break;
+            
+        case 'stopDevice':
+            // 停止设备推流
+            if (webClient.currentDevice) {
+                const [consoleId, serial] = splitDeviceId(webClient.currentDevice);
+                
+                log('INFO', `[Web客户端] ${clientId} 请求停止设备: ${serial}`);
+                
+                // 从观看者索引中移除
+                removeViewerFromIndex(webClient.currentDevice, webClient.ws);
+                
+                const consoleClient = consoleClients.get(consoleId);
+                if (consoleClient) {
+                    // 更新观看者计数
+                    const device = consoleClient.devices.get(serial);
+                    if (device && device.viewerCount > 0) {
+                        device.viewerCount--;
+                    }
+                    
+                    // 通知控制台停止该设备
+                    if (consoleClient.ws.readyState === WebSocket.OPEN) {
+                        consoleClient.ws.send(JSON.stringify({
+                            type: 'stopDevice',
+                            serial: serial
+                        }));
+                        log('INFO', `[Web客户端] 已转发停止请求到控制台: ${consoleId}`);
+                    }
+                }
+                
+                // 清除客户端的当前设备
+                webClient.currentDevice = null;
+            }
+            break;
+            
+        case 'updateDeviceName':
+            // 更新设备名称
+            if (msg.deviceId && msg.customName) {
+                const [consoleId, serial] = splitDeviceId(msg.deviceId);
+                
+                log('INFO', `[Web客户端] ${clientId} 请求更新设备名称: ${serial} -> ${msg.customName}`);
+                
+                // 直接在服务端保存设备别名
+                deviceAliases.set(serial, msg.customName);
+                saveDeviceAliases();
+                
+                // 更新内存中的设备信息
+                const consoleClient = consoleClients.get(consoleId);
+                if (consoleClient) {
+                    const device = consoleClient.devices.get(serial);
+                    if (device) {
+                        device.customName = msg.customName;
+                    }
+                }
+                
+                // 广播更新后的设备列表
+                broadcastDeviceListToWeb();
+            }
+            break;
+    }
+}
+
+// 设备观看者索引：deviceKey -> Set<WebSocket>
+// 用于视频转发时 O(1) 查找观看者，避免遍历所有 Web 客户端
+const deviceViewerIndex = new Map();
+
+function addViewerToIndex(deviceId, ws) {
+    if (!deviceViewerIndex.has(deviceId)) {
+        deviceViewerIndex.set(deviceId, new Set());
+    }
+    deviceViewerIndex.get(deviceId).add(ws);
+}
+
+function removeViewerFromIndex(deviceId, ws) {
+    const viewers = deviceViewerIndex.get(deviceId);
+    if (viewers) {
+        viewers.delete(ws);
+        if (viewers.size === 0) {
+            deviceViewerIndex.delete(deviceId);
+        }
+    }
+}
+
+// 向单个 Web 客户端发送设备列表
+function sendDeviceListToWeb(ws) {
+    const allDevices = [];
+    consoleClients.forEach((client, consoleId) => {
+        client.devices.forEach((device, serial) => {
+            // 创建一个包含所有设备信息的对象，包括缩略图
+            const deviceInfo = {
+                id: `${consoleId}:${serial}`,
+                serial: device.serial,
+                model: device.model,
+                state: device.state,
+                status: device.status,
+                consoleId: consoleId
+            };
+            
+            // 如果设备有缩略图数据，也包含在内
+            if (device.thumbnail) {
+                deviceInfo.thumbnail = device.thumbnail;
+                log('DEBUG', `[WS] 发送设备 ${serial} 缩略图数据，长度: ${device.thumbnail.length}`);
+            }
+            
+            // 检查服务端是否有设备别名
+            if (deviceAliases.has(serial)) {
+                deviceInfo.customName = deviceAliases.get(serial);
+            }
+            // 如果没有服务端别名，但设备本身有自定义名称，也包含在内
+            else if (device.customName) {
+                deviceInfo.customName = device.customName;
+            }
+            
+            allDevices.push(deviceInfo);
+        });
+    });
+    
+    log('DEBUG', `[WS] 发送设备列表到Web客户端，设备数量: ${allDevices.length}`);
+    ws.send(JSON.stringify({
+        type: 'deviceList',
+        devices: allDevices
+    }));
+}
+
+// 广播设备列表到所有 Web 客户端（带 dirty 标记，避免重复广播）
+let _broadcastDirty = false;
+let _broadcastTimer = null;
+
+function broadcastDeviceListToWeb() {
+    _broadcastDirty = true;
+    // 合并短时间内的多次广播为一次（100ms debounce）
+    if (!_broadcastTimer) {
+        _broadcastTimer = setTimeout(() => {
+            _broadcastTimer = null;
+            if (!_broadcastDirty) return;
+            _broadcastDirty = false;
+            
+            const allDevices = [];
+            consoleClients.forEach((consoleClient, consoleId) => {
+                consoleClient.devices.forEach((device, serial) => {
+                    allDevices.push({
+                        ...device,
+                        consoleId: consoleId
+                    });
+                });
+            });
+            
+            const message = JSON.stringify({
+                type: 'deviceList',
+                devices: allDevices
+            });
+            
+            webClients.forEach((client) => {
+                if (client.ws.readyState === WebSocket.OPEN) {
+                    client.ws.send(message);
+                }
+            });
+            
+            log('DEBUG', `[设备列表] 已广播到 ${webClients.size} 个 Web 客户端`);
+        }, 100);
+    }
+}
+
+// 广播单个设备更新到所有 Web 客户端
+function broadcastDeviceUpdateToWeb(device) {
+    const message = JSON.stringify({
+        type: 'deviceUpdate',
+        device: device
+    });
+    webClients.forEach((client) => {
+        if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(message);
+        }
+    });
+}
+
+// 定期广播设备列表（每分钟一次，仅当有变更时）
+setInterval(() => {
+    if (webClients.size > 0) {
+        broadcastDeviceListToWeb();
+    }
+}, 60000); // 60秒
+
+// 启动 HTTP 服务器
+httpServer.listen(HTTP_PORT, () => {
+    log('INFO', '========================================');
+    log('INFO', '  Scrcpy 中继服务器已启动');
+    log('INFO', '========================================');
+    log('INFO', `  HTTP 端口: ${HTTP_PORT}`);
+    log('INFO', `  Web界面: http://localhost:${HTTP_PORT}`);
+    log('INFO', `  scrcpy 连接: ws://localhost:${HTTP_PORT}`);
+    
+    if (ENABLE_HTTPS) {
+        log('INFO', '');
+        log('INFO', `  HTTPS 端口: ${HTTPS_PORT}`);
+        log('INFO', `  安全访问: https://localhost:${HTTPS_PORT}`);
+        log('INFO', `  远程访问: wss://your-domain:${HTTPS_PORT}`);
+    }
+    
+    log('INFO', '========================================');
+    log('INFO', '');
+    log('INFO', '使用说明：');
+    log('INFO', `  - scrcpy 使用 HTTP 端口 ${HTTP_PORT} （无需 SSL）`);
+    if (ENABLE_HTTPS) {
+        log('INFO', `  - Web 浏览器可使用 HTTPS 端口 ${HTTPS_PORT}`);
+    }
+    log('INFO', '========================================');
+});
+
+// 如果启用了 HTTPS，启动 HTTPS 服务器
+if (ENABLE_HTTPS && httpsServer) {
+    httpsServer.listen(HTTPS_PORT, () => {
+        log('INFO', `[HTTPS] 服务器已在端口 ${HTTPS_PORT} 启动`);
+    });
+}
+
+// 定期检查空闲设备并自动关闭
+setInterval(() => {
+    const now = Date.now();
+    
+    consoleClients.forEach((consoleClient, consoleId) => {
+        consoleClient.devices.forEach((device, serial) => {
+            // 只检查正在推流的设备
+            if (device.status === 'streaming' && device.videoWs) {
+                const viewerCount = device.viewerCount || 0;
+                const lastActivityTime = device.lastActivityTime || 0;
+                const idleTime = now - lastActivityTime;
+                
+                // 如果没有观看者且空闲超过设定时间，关闭推流
+                if (viewerCount === 0 && idleTime > IDLE_TIMEOUT) {
+                    log('INFO', `[空闲检测] 设备 ${serial} 已空闲 ${Math.floor(idleTime / 1000)}秒，自动关闭推流`);
+                    
+                    // 通知控制台停止该设备
+                    if (consoleClient.ws.readyState === WebSocket.OPEN) {
+                        consoleClient.ws.send(JSON.stringify({
+                            type: 'stopDevice',
+                            serial: serial,
+                            reason: 'idle_timeout'
+                        }));
+                    }
+                }
+            }
+        });
+    });
+}, 60000); // 每分钟检查一次
+
+log('INFO', `[空闲检测] 已启动，超时时间: ${IDLE_TIMEOUT / 1000}秒`);
+
+// Graceful shutdown：优雅关闭服务器
+function gracefulShutdown(signal) {
+    log('INFO', `[关闭] 收到 ${signal} 信号，正在优雅关闭...`);
+    
+    // 通知所有控制台客户端
+    consoleClients.forEach((client, id) => {
+        try {
+            client.ws.close(1001, '服务器关闭');
+        } catch (e) { /* ignore */ }
+    });
+    
+    // 通知所有 Web 客户端
+    webClients.forEach((client, id) => {
+        try {
+            client.ws.close(1001, '服务器关闭');
+        } catch (e) { /* ignore */ }
+    });
+    
+    // 关闭 HTTP 服务器
+    httpServer.close(() => {
+        log('INFO', '[关闭] HTTP 服务器已关闭');
+    });
+    
+    // 关闭 HTTPS 服务器
+    if (httpsServer) {
+        httpsServer.close(() => {
+            log('INFO', '[关闭] HTTPS 服务器已关闭');
+        });
+    }
+    
+    // 5秒后强制退出
+    setTimeout(() => {
+        log('WARN', '[关闭] 强制退出');
+        process.exit(0);
+    }, 5000);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

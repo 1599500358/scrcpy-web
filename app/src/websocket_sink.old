@@ -1,0 +1,493 @@
+#include "websocket_sink.h"
+
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+# include <winsock2.h>
+#else
+# include <sys/socket.h>
+# include <netinet/in.h>
+# include <arpa/inet.h>
+# include <unistd.h>
+#endif
+
+#include "util/log.h"
+
+/** Downcast frame_sink to sc_websocket_sink */
+#define DOWNCAST(SINK) container_of(SINK, struct sc_websocket_sink, frame_sink)
+
+#define AVIO_BUFFER_SIZE 4096
+
+// WebSocket frame header
+#define WS_OPCODE_BINARY 0x02
+#define WS_FIN 0x80
+
+static bool
+send_websocket_frame(sc_socket socket, const uint8_t *data, size_t len) {
+    uint8_t header[10];
+    size_t header_len;
+    
+    header[0] = WS_FIN | WS_OPCODE_BINARY;
+    
+    if (len < 126) {
+        header[1] = (uint8_t)len;
+        header_len = 2;
+    } else if (len < 65536) {
+        header[1] = 126;
+        header[2] = (len >> 8) & 0xFF;
+        header[3] = len & 0xFF;
+        header_len = 4;
+    } else {
+        header[1] = 127;
+        for (int i = 0; i < 8; i++) {
+            header[9 - i] = (len >> (i * 8)) & 0xFF;
+        }
+        header_len = 10;
+    }
+    
+    ssize_t w = send(socket, (char*)header, header_len, 0);
+    if (w < 0 || (size_t)w != header_len) {
+        return false;
+    }
+    
+    w = send(socket, (char*)data, len, 0);
+    if (w < 0 || (size_t)w != len) {
+        return false;
+    }
+    
+    return true;
+}
+
+static int
+avio_write_packet(void *opaque, uint8_t *buf, int buf_size) {
+    struct sc_websocket_sink *ws = opaque;
+    
+    if (!ws->connected || ws->client_socket == SC_SOCKET_NONE) {
+        return buf_size; // Pretend success even if no client
+    }
+    
+    if (!send_websocket_frame(ws->client_socket, buf, buf_size)) {
+        LOGW("Failed to send data via WebSocket");
+        return -1;
+    }
+    
+    return buf_size;
+}
+
+static bool
+connect_to_relay_server(struct sc_websocket_sink *ws) {
+    // 解析服务器地址
+    char host[256];
+    char port[16] = "8080";
+    
+    char *colon = strchr(ws->server_url, ':');
+    if (colon) {
+        size_t host_len = colon - ws->server_url;
+        if (host_len >= sizeof(host)) {
+            host_len = sizeof(host) - 1;
+        }
+        memcpy(host, ws->server_url, host_len);
+        host[host_len] = '\0';
+        strncpy(port, colon + 1, sizeof(port) - 1);
+    } else {
+        strncpy(host, ws->server_url, sizeof(host) - 1);
+    }
+    
+    LOGI("Connecting to relay server %s:%s", host, port);
+    
+    // 创建 socket
+    ws->client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (ws->client_socket == SC_SOCKET_NONE) {
+        LOGE("Could not create WebSocket client socket");
+        return false;
+    }
+    
+    // 解析地址
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(port));
+    
+    // 简单处理，仅支持 IP 地址和 localhost
+    if (strcmp(host, "localhost") == 0) {
+        server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    } else {
+        server_addr.sin_addr.s_addr = inet_addr(host);
+    }
+    
+    // 连接
+    if (connect(ws->client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        LOGE("Could not connect to relay server %s:%s", host, port);
+        net_close(ws->client_socket);
+        ws->client_socket = SC_SOCKET_NONE;
+        return false;
+    }
+    
+    // 发送 WebSocket 客户端握手
+    char handshake[1024];
+    snprintf(handshake, sizeof(handshake),
+        "GET /?type=scrcpy&serial=%s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n",
+        ws->device_serial, host);
+    
+    if (send(ws->client_socket, handshake, strlen(handshake), 0) <= 0) {
+        LOGE("Failed to send WebSocket handshake");
+        net_close(ws->client_socket);
+        ws->client_socket = SC_SOCKET_NONE;
+        return false;
+    }
+    
+    // 接收响应
+    char response[1024];
+    ssize_t received = recv(ws->client_socket, response, sizeof(response) - 1, 0);
+    if (received <= 0) {
+        LOGE("Failed to receive WebSocket handshake response");
+        net_close(ws->client_socket);
+        ws->client_socket = SC_SOCKET_NONE;
+        return false;
+    }
+    
+    response[received] = '\0';
+    
+    // 检查是否包含 "101 Switching Protocols"
+    if (!strstr(response, "101 Switching Protocols")) {
+        LOGE("WebSocket handshake failed: %s", response);
+        net_close(ws->client_socket);
+        ws->client_socket = SC_SOCKET_NONE;
+        return false;
+    }
+    
+    LOGI("Connected to relay server successfully");
+    return true;
+}
+
+static int
+run_websocket_connector(void *data) {
+    struct sc_websocket_sink *ws = data;
+    
+    // 尝试连接到中继服务器
+    if (!connect_to_relay_server(ws)) {
+        LOGE("Failed to connect to relay server");
+        ws->stopped = true;
+        return 1;
+    }
+    
+    sc_mutex_lock(&ws->mutex);
+    ws->connected = true;
+    sc_mutex_unlock(&ws->mutex);
+    
+    LOGI("WebSocket connector ready, device: %s", ws->device_serial);
+    
+    // 保持连接，直到停止
+    while (!ws->stopped) {
+        // TODO: 可以在这里处理心跳包或重连逻辑
+#ifdef _WIN32
+        Sleep(1000);
+#else
+        sleep(1);
+#endif
+    }
+    
+    LOGD("WebSocket connector thread ended");
+    return 0;
+}
+
+static bool
+encode_and_write_frame(struct sc_websocket_sink *ws, const AVFrame *frame) {
+    int ret = avcodec_send_frame(ws->encoder_ctx, frame);
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
+        LOGE("Could not send websocket video frame: %d", ret);
+        return false;
+    }
+    
+    AVPacket *packet = ws->packet;
+    ret = avcodec_receive_packet(ws->encoder_ctx, packet);
+    if (ret == 0) {
+        // Write packet to AVIO (which will call our write callback)
+        av_write_frame(ws->format_ctx, packet);
+        av_packet_unref(packet);
+    } else if (ret != AVERROR(EAGAIN)) {
+        LOGE("Could not receive websocket video packet: %d", ret);
+        return false;
+    }
+    
+    return true;
+}
+
+static int
+run_websocket_encoder(void *data) {
+    struct sc_websocket_sink *ws = data;
+    
+    for (;;) {
+        sc_mutex_lock(&ws->mutex);
+        
+        while (!ws->stopped && !ws->has_frame) {
+            sc_cond_wait(&ws->cond, &ws->mutex);
+        }
+        
+        if (ws->stopped) {
+            sc_mutex_unlock(&ws->mutex);
+            break;
+        }
+        
+        ws->has_frame = false;
+        sc_mutex_unlock(&ws->mutex);
+        
+        sc_frame_buffer_consume(&ws->fb, ws->frame);
+        
+        bool ok = encode_and_write_frame(ws, ws->frame);
+        av_frame_unref(ws->frame);
+        if (!ok) {
+            LOGE("Could not encode frame for websocket");
+            // Continue anyway
+        }
+    }
+    
+    LOGD("WebSocket encoder thread ended");
+    return 0;
+}
+
+static bool
+sc_websocket_sink_open(struct sc_websocket_sink *ws, const AVCodecContext *ctx) {
+    bool ok = sc_frame_buffer_init(&ws->fb);
+    if (!ok) {
+        return false;
+    }
+    
+    ok = sc_mutex_init(&ws->mutex);
+    if (!ok) {
+        goto error_frame_buffer_destroy;
+    }
+    
+    ok = sc_cond_init(&ws->cond);
+    if (!ok) {
+        goto error_mutex_destroy;
+    }
+    
+    // Initialize encoder
+    const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!encoder) {
+        LOGE("H264 encoder not found");
+        goto error_cond_destroy;
+    }
+    
+    ws->encoder_ctx = avcodec_alloc_context3(encoder);
+    if (!ws->encoder_ctx) {
+        LOG_OOM();
+        goto error_cond_destroy;
+    }
+    
+    ws->encoder_ctx->width = ctx->width;
+    ws->encoder_ctx->height = ctx->height;
+    ws->encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    ws->encoder_ctx->time_base.num = 1;
+    ws->encoder_ctx->time_base.den = 30;
+    ws->encoder_ctx->bit_rate = 2000000;
+    ws->encoder_ctx->gop_size = 30;
+    
+    if (avcodec_open2(ws->encoder_ctx, encoder, NULL) < 0) {
+        LOGE("Could not open H264 encoder for WebSocket");
+        goto error_free_encoder_ctx;
+    }
+    
+    // Allocate AVIO context for custom output
+    ws->avio_buffer = av_malloc(AVIO_BUFFER_SIZE);
+    if (!ws->avio_buffer) {
+        LOG_OOM();
+        goto error_free_encoder_ctx;
+    }
+    
+    ws->avio_ctx = avio_alloc_context(ws->avio_buffer, AVIO_BUFFER_SIZE,
+                                      1, ws, NULL, avio_write_packet, NULL);
+    if (!ws->avio_ctx) {
+        LOG_OOM();
+        goto error_free_avio_buffer;
+    }
+    
+    // Create format context
+    ws->format_ctx = avformat_alloc_context();
+    if (!ws->format_ctx) {
+        LOG_OOM();
+        goto error_free_avio_ctx;
+    }
+    
+    ws->format_ctx->pb = ws->avio_ctx;
+    ws->format_ctx->oformat = av_guess_format("h264", NULL, NULL);
+    
+    ws->frame = av_frame_alloc();
+    if (!ws->frame) {
+        LOG_OOM();
+        goto error_free_format_ctx;
+    }
+    
+    ws->packet = av_packet_alloc();
+    if (!ws->packet) {
+        LOG_OOM();
+        goto error_free_frame;
+    }
+    
+    ws->has_frame = false;
+    ws->header_written = false;
+    ws->stopped = false;
+    ws->connected = false;
+    ws->client_socket = SC_SOCKET_NONE;
+    
+    LOGI("Starting WebSocket connector and encoder threads...");
+    
+    // Start connector thread
+    LOGD("Starting WebSocket connector thread");
+    ok = sc_thread_create(&ws->connector_thread, run_websocket_connector,
+                         "scrcpy-ws-conn", ws);
+    if (!ok) {
+        LOGE("Could not start WebSocket connector thread");
+        goto error_free_packet;
+    }
+    
+    // Start encoder thread
+    LOGD("Starting WebSocket encoder thread");
+    ok = sc_thread_create(&ws->encoder_thread, run_websocket_encoder,
+                         "scrcpy-ws-enc", ws);
+    if (!ok) {
+        LOGE("Could not start WebSocket encoder thread");
+        goto error_free_packet;
+    }
+    
+    LOGI("WebSocket sink opened successfully");
+    LOGI("WebSocket sink started, connecting to %s", ws->server_url);
+    return true;
+
+error_free_packet:
+    av_packet_free(&ws->packet);
+error_free_frame:
+    av_frame_free(&ws->frame);
+error_free_format_ctx:
+    avformat_free_context(ws->format_ctx);
+error_free_avio_ctx:
+    av_free(ws->avio_ctx);
+error_free_avio_buffer:
+    av_free(ws->avio_buffer);
+error_free_encoder_ctx:
+    avcodec_free_context(&ws->encoder_ctx);
+error_cond_destroy:
+    sc_cond_destroy(&ws->cond);
+error_mutex_destroy:
+    sc_mutex_destroy(&ws->mutex);
+error_frame_buffer_destroy:
+    sc_frame_buffer_destroy(&ws->fb);
+    
+    return false;
+}
+
+static void
+sc_websocket_sink_close(struct sc_websocket_sink *ws) {
+    sc_mutex_lock(&ws->mutex);
+    ws->stopped = true;
+    sc_cond_signal(&ws->cond);
+    sc_mutex_unlock(&ws->mutex);
+    
+    // Close socket to unblock recv()
+    if (ws->client_socket != SC_SOCKET_NONE) {
+        net_close(ws->client_socket);
+    }
+    
+    sc_thread_join(&ws->connector_thread, NULL);
+    sc_thread_join(&ws->encoder_thread, NULL);
+    
+    av_packet_free(&ws->packet);
+    av_frame_free(&ws->frame);
+    avformat_free_context(ws->format_ctx);
+    av_free(ws->avio_ctx);
+    avcodec_free_context(&ws->encoder_ctx);
+    sc_cond_destroy(&ws->cond);
+    sc_mutex_destroy(&ws->mutex);
+    sc_frame_buffer_destroy(&ws->fb);
+}
+
+static bool
+sc_websocket_sink_push(struct sc_websocket_sink *ws, const AVFrame *frame) {
+    bool previous_skipped;
+    bool ok = sc_frame_buffer_push(&ws->fb, frame, &previous_skipped);
+    if (!ok) {
+        return false;
+    }
+    
+    if (!previous_skipped) {
+        sc_mutex_lock(&ws->mutex);
+        ws->has_frame = true;
+        sc_cond_signal(&ws->cond);
+        sc_mutex_unlock(&ws->mutex);
+    }
+    
+    return true;
+}
+
+static bool
+sc_websocket_frame_sink_open(struct sc_frame_sink *sink,
+                             const AVCodecContext *ctx) {
+    struct sc_websocket_sink *ws = DOWNCAST(sink);
+    return sc_websocket_sink_open(ws, ctx);
+}
+
+static void
+sc_websocket_frame_sink_close(struct sc_frame_sink *sink) {
+    struct sc_websocket_sink *ws = DOWNCAST(sink);
+    sc_websocket_sink_close(ws);
+}
+
+static bool
+sc_websocket_frame_sink_push(struct sc_frame_sink *sink, const AVFrame *frame) {
+    struct sc_websocket_sink *ws = DOWNCAST(sink);
+    return sc_websocket_sink_push(ws, frame);
+}
+
+bool
+sc_websocket_sink_init(struct sc_websocket_sink *ws, const char *server_url,
+                       const char *device_serial) {
+    strncpy(ws->server_url, server_url, sizeof(ws->server_url) - 1);
+    ws->server_url[sizeof(ws->server_url) - 1] = '\0';
+    
+    strncpy(ws->device_serial, device_serial, sizeof(ws->device_serial) - 1);
+    ws->device_serial[sizeof(ws->device_serial) - 1] = '\0';
+    
+    static const struct sc_frame_sink_ops ops = {
+        .open = sc_websocket_frame_sink_open,
+        .close = sc_websocket_frame_sink_close,
+        .push = sc_websocket_frame_sink_push,
+    };
+    
+    ws->frame_sink.ops = &ops;
+    
+    LOGI("WebSocket sink initialized for device %s, server: %s", 
+         device_serial, server_url);
+    
+    return true;
+}
+
+void
+sc_websocket_sink_destroy(struct sc_websocket_sink *ws) {
+    // 停止连接器线程
+    sc_mutex_lock(&ws->mutex);
+    ws->stopped = true;
+    sc_mutex_unlock(&ws->mutex);
+    
+    // 关闭 socket 以触发线程退出
+    if (ws->client_socket != SC_SOCKET_NONE) {
+        net_close(ws->client_socket);
+    }
+    
+    sc_thread_join(&ws->connector_thread, NULL);
+    
+    sc_cond_destroy(&ws->cond);
+    sc_mutex_destroy(&ws->mutex);
+    
+    LOGI("WebSocket sink destroyed");
+}
