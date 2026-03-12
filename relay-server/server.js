@@ -8,6 +8,17 @@ const crypto = require('crypto');
 const session = require('express-session');
 const bodyParser = require('body-parser');
 const AuthManager = require('./auth-manager');
+const WebRTC = require('./webrtc-signaling');
+const TurnServer = require('./turn-server');
+
+// WebRTC 配置
+const WEBRTC_ENABLED = process.env.WEBRTC_ENABLED !== 'false'; // 默认启用
+const TURN_ENABLED = process.env.TURN_ENABLED === 'true'; // TURN 服务器开关
+const TURN_HOST = process.env.TURN_HOST || '';
+const TURN_PORT = process.env.TURN_PORT || '3478';
+const TURN_USERNAME = process.env.TURN_USERNAME || '';
+const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || '';
+const TURN_SECRET = process.env.TURN_SECRET || ''; // 用于生成临时凭证
 
 // 日志级别控制
 const LOG_LEVELS = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
@@ -34,7 +45,22 @@ const HTTPS_PORT = process.env.HTTPS_PORT || 8443; // 远程 Web 使用
 const ENABLE_HTTPS = process.env.ENABLE_HTTPS === 'true' || false;
 
 // 创建 HTTP 服务器（总是启用）
-const httpServer = http.createServer(app);
+// 如果启用了 HTTPS，HTTP 端口只做两件事：1. WebSocket 连接 2. 其他请求重定向到 HTTPS
+const httpApp = ENABLE_HTTPS ? express() : app;
+if (ENABLE_HTTPS) {
+    // HTTP 重定向中间件 - 将普通 HTTP 请求重定向到 HTTPS
+    httpApp.use((req, res, next) => {
+        // 如果是 WebSocket 升级请求，跳过重定向
+        if (req.headers.upgrade === 'websocket') {
+            return next();
+        }
+        // 否则重定向到 HTTPS
+        const httpsUrl = `https://${req.headers.host.split(':')[0]}:${HTTPS_PORT}${req.url}`;
+        res.redirect(301, httpsUrl);
+    });
+}
+
+const httpServer = http.createServer(httpApp);
 httpServer.on('connection', (socket) => {
     socket.setNoDelay(true);
 });
@@ -208,12 +234,79 @@ app.get('/api/user', authManager.requireAuth, (req, res) => {
     res.json({ user: req.session.user });
 });
 
-// 受保护的静态文件服务
-app.use('/static', express.static(path.join(__dirname, 'public')));
-app.use(express.static(path.join(__dirname, 'public')));
+// API: 获取 WebRTC 配置（包括 TURN 凭证）
+app.get('/api/webrtc-config', authManager.requireAuth, (req, res) => {
+    const config = {
+        enabled: WEBRTC_ENABLED,
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+    };
 
+    // 如果配置了 TURN 服务器
+    if (TURN_HOST && (TURN_USERNAME || TURN_SECRET)) {
+        let turnUsername = TURN_USERNAME;
+        let turnCredential = TURN_CREDENTIAL;
+
+        // 如果使用密钥生成临时凭证
+        if (TURN_SECRET && !TURN_USERNAME) {
+            const creds = WebRTC.generateTurnCredentials(TURN_SECRET, 86400); // 24小时有效
+            turnUsername = creds.username;
+            turnCredential = creds.credential;
+        }
+
+        if (turnUsername && turnCredential) {
+            config.iceServers.push({
+                urls: `turn:${TURN_HOST}:${TURN_PORT}`,
+                username: turnUsername,
+                credential: turnCredential
+            });
+            // 同时添加 TURN TLS（如果端口是 5349）
+            if (TURN_PORT === '5349' || TURN_PORT === 5349) {
+                config.iceServers.push({
+                    urls: `turns:${TURN_HOST}:5349`,
+                    username: turnUsername,
+                    credential: turnCredential
+                });
+            }
+        }
+    }
+
+    res.json(config);
+});
+
+// 公开访问的静态资源（登录页和相关资源）
+app.use('/login', express.static(path.join(__dirname, 'public', 'login.html')));
+
+// 公开访问的静态资源文件（CSS、JS、图片等不需要认证）
+app.use(express.static(path.join(__dirname, 'public'), {
+    // 对 HTML 文件特殊处理：需要认证
+    setHeaders: (res, path) => {
+        if (path.endsWith('.html') && !path.includes('login')) {
+            // HTML 文件会在后续路由中处理认证
+        }
+    }
+}));
+
+// 检查是否为已登录用户的中间件（用于静态文件）
+function checkAuthStatic(req, res, next) {
+    if (req.session && req.session.user) {
+        next();
+    } else {
+        // 未登录，重定向到登录页
+        res.redirect('/login');
+    }
+}
+
+// 需要认证的特定路由
 // 主页路由（需要认证）
 app.get('/', checkAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// index.html 需要认证
+app.get('/index.html', checkAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
@@ -716,7 +809,7 @@ function handleConsoleMessage(consoleId, msg) {
             if (prepareSerial) {
                 pendingDeviceStreams.set(prepareSerial, consoleId);
                 log('INFO', `[控制台] ${consoleId} 预注册设备推流: ${prepareSerial}`);
-                
+
                 // 回复确认
                 consoleClient.ws.send(JSON.stringify({
                     type: 'prepareStreamResponse',
@@ -725,7 +818,40 @@ function handleConsoleMessage(consoleId, msg) {
                 }));
             }
             break;
-            
+
+        // ========== WebRTC 信令处理 ==========
+        case 'webrtc-offer':
+            // 控制台发送 WebRTC Offer
+            if (WEBRTC_ENABLED) {
+                WebRTC.handleOffer(consoleId, msg, consoleClient.ws, webClients);
+            } else {
+                log('WARN', '[WebRTC] WebRTC 未启用');
+            }
+            break;
+
+        case 'webrtc-ice-candidate':
+            // 控制台发送 ICE Candidate
+            if (WEBRTC_ENABLED) {
+                WebRTC.handleIceCandidate(consoleId, { ...msg, from: 'console' }, consoleClients, webClients);
+            }
+            break;
+
+        case 'webrtc-connected':
+            // 控制台 WebRTC 连接成功
+            log('INFO', `[WebRTC] 控制台 ${consoleId} 设备 ${msg.deviceId} 连接成功`);
+            break;
+
+        case 'webrtc-disconnected':
+            // 控制台 WebRTC 连接断开
+            log('INFO', `[WebRTC] 控制台 ${consoleId} 设备 ${msg.deviceId} 连接断开`);
+            WebRTC.cleanupConnection(msg.deviceId);
+            break;
+
+        case 'webrtc-error':
+            // 控制台 WebRTC 错误
+            log('ERROR', `[WebRTC] 控制台 ${consoleId} 设备 ${msg.deviceId} 错误: ${msg.error}`);
+            break;
+
         default:
             log('WARN', `[控制台] 未知消息类型: ${msg.type}`);
             break;
@@ -881,6 +1007,36 @@ function handleWebMessage(clientId, msg) {
                 broadcastDeviceListToWeb();
             }
             break;
+
+        // ========== WebRTC 信令处理 ==========
+        case 'webrtc-answer':
+            // Web 客户端发送 WebRTC Answer
+            if (WEBRTC_ENABLED) {
+                WebRTC.handleAnswer(clientId, msg, consoleClients);
+            }
+            break;
+
+        case 'webrtc-ice-candidate':
+            // Web 客户端发送 ICE Candidate
+            if (WEBRTC_ENABLED) {
+                WebRTC.handleIceCandidate(clientId, { ...msg, from: 'web' }, consoleClients, webClients);
+            }
+            break;
+
+        case 'webrtc-connected':
+            // Web 客户端 WebRTC 连接成功
+            log('INFO', `[WebRTC] Web客户端 ${clientId} 设备 ${msg.deviceId} 连接成功`);
+            break;
+
+        case 'webrtc-disconnected':
+            // Web 客户端 WebRTC 连接断开
+            log('INFO', `[WebRTC] Web客户端 ${clientId} 设备 ${msg.deviceId} 连接断开`);
+            break;
+
+        case 'webrtc-error':
+            // Web 客户端 WebRTC 错误
+            log('ERROR', `[WebRTC] Web客户端 ${clientId} 设备 ${msg.deviceId} 错误: ${msg.error}`);
+            break;
     }
 }
 
@@ -1006,21 +1162,29 @@ setInterval(() => {
 }, 60000); // 60秒
 
 // 启动 HTTP 服务器
-httpServer.listen(HTTP_PORT, () => {
+httpServer.listen(HTTP_PORT, async () => {
     log('INFO', '========================================');
     log('INFO', '  Scrcpy 中继服务器已启动');
     log('INFO', '========================================');
     log('INFO', `  HTTP 端口: ${HTTP_PORT}`);
     log('INFO', `  Web界面: http://localhost:${HTTP_PORT}`);
     log('INFO', `  scrcpy 连接: ws://localhost:${HTTP_PORT}`);
-    
+
     if (ENABLE_HTTPS) {
         log('INFO', '');
         log('INFO', `  HTTPS 端口: ${HTTPS_PORT}`);
         log('INFO', `  安全访问: https://localhost:${HTTPS_PORT}`);
         log('INFO', `  远程访问: wss://your-domain:${HTTPS_PORT}`);
     }
-    
+
+    // 初始化 TURN 服务器
+    if (TURN_ENABLED) {
+        const turnStarted = await TurnServer.initTurnServer();
+        if (turnStarted) {
+            log('INFO', `  TURN 端口: ${TURN_PORT}`);
+        }
+    }
+
     log('INFO', '========================================');
     log('INFO', '');
     log('INFO', '使用说明：');
@@ -1073,7 +1237,10 @@ log('INFO', `[空闲检测] 已启动，超时时间: ${IDLE_TIMEOUT / 1000}秒`
 // Graceful shutdown：优雅关闭服务器
 function gracefulShutdown(signal) {
     log('INFO', `[关闭] 收到 ${signal} 信号，正在优雅关闭...`);
-    
+
+    // 停止 TURN 服务器
+    TurnServer.stopTurnServer();
+
     // 通知所有控制台客户端
     consoleClients.forEach((client, id) => {
         try {

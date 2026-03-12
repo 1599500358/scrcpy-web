@@ -1,5 +1,5 @@
-// 使用 Mediabunny WebCodecs 库的实现
-// Mediabunny 提供了强大的 H.264 解码和渲染能力
+// 使用 WebCodecs 实现 H.264 解码
+// 支持 WebSocket 和 WebRTC DataChannel 两种传输方式
 
 let ws = null;
 let currentDevice = null;
@@ -20,28 +20,237 @@ let lastFrameTime = 0;
 let lastStatsTime = 0;
 let bytesReceived = 0;
 
+// ========== WebRTC 相关 ==========
+let peerConnection = null;
+let dataChannel = null;
+let webrtcEnabled = false;
+let rtcConfig = null;
+let useWebRTC = false; // 是否使用 WebRTC 模式
+let pendingCandidates = []; // 缓存的 ICE candidates
+
 // 初始化
-window.onload = function() {
+window.onload = async function() {
     console.log('[INIT] 页面加载完成，初始化组件...');
-    
+
     // 获取 canvas 元素
     canvas = document.getElementById('videoCanvas');
     ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-    
+
     // 初始化解码器
     initDecoder();
-    
+
+    // 获取 WebRTC 配置
+    await fetchWebRTCConfig();
+
     // 连接 WebSocket
     connectWebSocket();
-    
+
     // 绑定登出按钮
     document.getElementById('logoutBtn').onclick = logout;
-    
+
     // 初始化触摸事件
     initTouchEvents();
-    
-    console.log('[INIT] 初始化完成');
+
+    console.log('[INIT] 初始化完成, WebRTC:', webrtcEnabled ? '启用' : '禁用');
 };
+
+// ========== WebRTC 函数 ==========
+
+// 获取 WebRTC 配置
+async function fetchWebRTCConfig() {
+    try {
+        const response = await fetch('/api/webrtc-config');
+        if (response.ok) {
+            const config = await response.json();
+            webrtcEnabled = config.enabled;
+            if (webrtcEnabled) {
+                rtcConfig = {
+                    iceServers: config.iceServers
+                };
+                console.log('[WebRTC] 配置获取成功, ICE Servers:', config.iceServers.length);
+            }
+        } else {
+            console.log('[WebRTC] 获取配置失败，将使用 WebSocket 模式');
+        }
+    } catch (e) {
+        console.error('[WebRTC] 获取配置出错:', e);
+    }
+}
+
+// 创建 WebRTC 连接（Answerer 模式）
+async function createWebRTCConnection(deviceId) {
+    if (!rtcConfig) {
+        console.error('[WebRTC] 配置未初始化');
+        return null;
+    }
+
+    console.log('[WebRTC] 创建 PeerConnection...');
+
+    try {
+        peerConnection = new RTCPeerConnection(rtcConfig);
+
+        // 监听 DataChannel
+        peerConnection.ondatachannel = (event) => {
+            console.log('[WebRTC] 收到 DataChannel:', event.channel.label);
+            dataChannel = event.channel;
+            setupDataChannel(dataChannel, deviceId);
+        };
+
+        // 监听 ICE Candidate
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                console.log('[WebRTC] 发送 ICE candidate');
+                ws.send(JSON.stringify({
+                    type: 'webrtc-ice-candidate',
+                    deviceId: deviceId,
+                    candidate: event.candidate,
+                    from: 'web'
+                }));
+            }
+        };
+
+        // 监听连接状态
+        peerConnection.onconnectionstatechange = () => {
+            const state = peerConnection.connectionState;
+            console.log('[WebRTC] 连接状态:', state);
+
+            if (state === 'connected') {
+                console.log('[WebRTC] ✅ P2P 连接成功');
+                useWebRTC = true;
+                ws.send(JSON.stringify({
+                    type: 'webrtc-connected',
+                    deviceId: deviceId
+                }));
+            } else if (state === 'disconnected' || state === 'failed') {
+                console.log('[WebRTC] ❌ 连接断开或失败');
+                useWebRTC = false;
+                ws.send(JSON.stringify({
+                    type: 'webrtc-disconnected',
+                    deviceId: deviceId
+                }));
+                // 回退到 WebSocket 模式
+                if (state === 'failed') {
+                    console.log('[WebRTC] 回退到 WebSocket 模式');
+                }
+            }
+        };
+
+        // 监听 ICE 连接状态
+        peerConnection.oniceconnectionstatechange = () => {
+            console.log('[WebRTC] ICE 状态:', peerConnection.iceConnectionState);
+        };
+
+        return peerConnection;
+    } catch (e) {
+        console.error('[WebRTC] 创建 PeerConnection 失败:', e);
+        return null;
+    }
+}
+
+// 设置 DataChannel
+function setupDataChannel(channel, deviceId) {
+    channel.binaryType = 'arraybuffer';
+
+    channel.onopen = () => {
+        console.log('[WebRTC] DataChannel 已打开');
+        useWebRTC = true;
+
+        // 隐藏加载提示
+        document.getElementById('loading').style.display = 'none';
+    };
+
+    channel.onclose = () => {
+        console.log('[WebRTC] DataChannel 已关闭');
+        useWebRTC = false;
+    };
+
+    channel.onerror = (error) => {
+        console.error('[WebRTC] DataChannel 错误:', error);
+        useWebRTC = false;
+    };
+
+    channel.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+            // 更新统计
+            bytesReceived += event.data.byteLength;
+
+            // 复用现有的 H.264 解码逻辑
+            decodeH264Data(new Uint8Array(event.data));
+        }
+    };
+}
+
+// 处理 WebRTC Offer
+async function handleWebRTCOffer(deviceId, sdp, consoleId) {
+    console.log('[WebRTC] 收到 Offer, deviceId:', deviceId);
+
+    if (!peerConnection) {
+        await createWebRTCConnection(deviceId);
+    }
+
+    if (!peerConnection) {
+        console.error('[WebRTC] 无法创建 PeerConnection');
+        return;
+    }
+
+    try {
+        // 设置远程描述
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+        console.log('[WebRTC] 已设置远程描述');
+
+        // 发送缓存的 ICE candidates
+        for (const candidate of pendingCandidates) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+        pendingCandidates = [];
+
+        // 创建 Answer
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        console.log('[WebRTC] 已创建 Answer');
+
+        // 发送 Answer 给控制台
+        ws.send(JSON.stringify({
+            type: 'webrtc-answer',
+            deviceId: deviceId,
+            sdp: answer
+        }));
+
+    } catch (e) {
+        console.error('[WebRTC] 处理 Offer 失败:', e);
+    }
+}
+
+// 处理 ICE Candidate（来自控制台）
+async function handleWebRTCIceCandidate(deviceId, candidate) {
+    console.log('[WebRTC] 收到 ICE candidate');
+
+    if (peerConnection && peerConnection.remoteDescription) {
+        try {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) {
+            console.error('[WebRTC] 添加 ICE candidate 失败:', e);
+        }
+    } else {
+        // 缓存，等 remoteDescription 设置后再添加
+        pendingCandidates.push(candidate);
+    }
+}
+
+// 关闭 WebRTC 连接
+function closeWebRTC() {
+    if (dataChannel) {
+        dataChannel.close();
+        dataChannel = null;
+    }
+    if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+    }
+    useWebRTC = false;
+    pendingCandidates = [];
+    console.log('[WebRTC] 连接已关闭');
+}
 
 // 初始化视频解码器
 function initDecoder() {
@@ -220,6 +429,23 @@ function handleTextMessage(data) {
             case 'error':
                 showError(message.message);
                 break;
+
+            // ========== WebRTC 信令消息 ==========
+            case 'webrtc-offer':
+                // 收到控制台的 WebRTC Offer
+                handleWebRTCOffer(message.deviceId, message.sdp, message.consoleId);
+                break;
+
+            case 'webrtc-ice-candidate':
+                // 收到 ICE Candidate
+                handleWebRTCIceCandidate(message.deviceId, message.candidate);
+                break;
+
+            case 'webrtc-waiting':
+                // 控制台等待连接（暂无 Web 客户端）
+                console.log('[WebRTC] 控制台等待中:', message.message);
+                break;
+
             default:
                 console.log('[WS] 未知消息类型:', message.type);
         }
@@ -230,15 +456,20 @@ function handleTextMessage(data) {
     }
 }
 
-// 处理二进制消息（视频数据）
+// 处理二进制消息（视频数据）- WebSocket 模式
 function handleBinaryMessage(data) {
+    // 如果正在使用 WebRTC，忽略 WebSocket 二进制数据
+    if (useWebRTC) {
+        return;
+    }
+
     if (!isDecoderReady || !videoDecoder) {
         return;
     }
-    
+
     const buffer = new Uint8Array(data);
     bytesReceived += buffer.length;
-    
+
     // 直接解码 H.264 Annex-B 格式数据
     decodeH264Data(buffer);
 }
@@ -533,14 +764,17 @@ function updateSingleDevice(device) {
 function selectDevice(deviceId, evt) {
     console.log('[DEVICE] 选择设备:', deviceId);
     currentDevice = deviceId;
-    
+
     // 重置解码器
     if (videoDecoder && videoDecoder.state !== 'unconfigured') {
         videoDecoder.reset();
     }
     nalBuffer = [];
     waitingForKeyframe = false;
-    
+
+    // 关闭之前的 WebRTC 连接
+    closeWebRTC();
+
     // 更新 UI
     document.querySelectorAll('.device-item').forEach(item => {
         item.classList.remove('selected');
@@ -549,20 +783,21 @@ function selectDevice(deviceId, evt) {
         const item = evt.target.closest('.device-item');
         if (item) item.classList.add('selected');
     }
-    
-    // 通知服务器
+
+    // 通知服务器选择设备（控制台会发送 WebRTC Offer）
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
             type: 'selectDevice',
-            deviceId: deviceId
+            deviceId: deviceId,
+            webrtc: webrtcEnabled // 告诉服务器我们支持 WebRTC
         }));
     }
-    
+
     // 显示视频区域
     document.getElementById('noDevice').style.display = 'none';
     document.getElementById('videoCanvas').style.display = 'block';
     document.getElementById('loading').style.display = 'flex';
-    
+
     // 重置统计
     frameCount = 0;
     lastFrameTime = 0;
@@ -591,7 +826,7 @@ function disconnect() {
     if (!currentDevice) {
         return;
     }
-    
+
     // 通知服务器停止设备推流
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -600,15 +835,18 @@ function disconnect() {
         }));
         console.log('[DEVICE] 请求停止设备:', currentDevice);
     }
-    
+
+    // 关闭 WebRTC 连接
+    closeWebRTC();
+
     currentDevice = null;
-    
+
     if (videoDecoder && videoDecoder.state !== 'unconfigured') {
         videoDecoder.reset();
     }
     nalBuffer = [];
     waitingForKeyframe = false;
-    
+
     document.getElementById('noDevice').style.display = 'block';
     document.getElementById('videoCanvas').style.display = 'none';
     document.querySelectorAll('.device-item').forEach(item => {

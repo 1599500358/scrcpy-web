@@ -1,7 +1,7 @@
 {
   "name": "scrcpy-relay-server",
-  "version": "1.0.0",
-  "description": "WebSocket relay server for remote scrcpy control",
+  "version": "1.1.0",
+  "description": "WebSocket relay server for remote scrcpy control with WebRTC P2P support",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
     "scrcpy",
     "websocket",
     "relay",
-    "remote-control"
+    "remote-control",
+    "webrtc"
   ],
   "author": "",
   "license": "Apache-2.0",
@@ -22,6 +23,7 @@
     "express": "^4.18.2",
     "express-session": "^1.18.2",
     "mediabunny": "^1.25.0",
+    "node-turn": "^0.0.6",
     "ws": "^8.14.2"
   },
   "devDependencies": {

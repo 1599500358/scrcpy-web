@@ -12,6 +12,11 @@
 #include <ole2.h>
 #include <process.h>  // 添加线程支持
 
+// WebRTC 支持（可选，编译时使用 -D USE_WEBRTC 启用）
+#ifdef USE_WEBRTC
+#include "webrtc_support.h"
+#endif
+
 // WIC 接口 GUID 声明（使用 extern 避免重复定义）
 /*
 extern const GUID CLSID_WICImagingFactory;
@@ -24,9 +29,16 @@ extern const GUID GUID_WICPixelFormat24bppBGR;
 #define WS_RECV_BUFFER_SIZE (1024 * 256) // 256KB WebSocket 接收缓冲区
 #define MAX_DEVICES 32
 #define MAX_WS_PAYLOAD_SIZE (1024 * 1024) // 1MB 最大 WebSocket 消息
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 #define MAX_RECONNECT_ATTEMPTS 10
 #define RECONNECT_BASE_DELAY 1000 // 初始重连延迟 1 秒
+
+// WebRTC 配置
+#ifdef USE_WEBRTC
+#define WEBRTC_STUN_SERVER "stun.l.google.com:19302"
+static bool g_webrtc_enabled = false;
+static WebRTCConfig g_webrtc_config = {0};
+#endif
 
 // 线程参数结构
 typedef struct {
@@ -134,11 +146,31 @@ int main(int argc, char* argv[]) {
     }
     
     print_banner();
-    
+
     // 解析命令行参数
     if (argc > 1) {
         strncpy(server_url, argv[1], sizeof(server_url) - 1);
     }
+
+#ifdef USE_WEBRTC
+    // 初始化 WebRTC
+    print_log("INFO", "初始化 WebRTC...");
+    strncpy(g_webrtc_config.stun_server, WEBRTC_STUN_SERVER, sizeof(g_webrtc_config.stun_server) - 1);
+    // TURN 服务器配置可从环境变量读取
+    char* turn_host = getenv("TURN_HOST");
+    char* turn_user = getenv("TURN_USERNAME");
+    char* turn_pass = getenv("TURN_CREDENTIAL");
+    if (turn_host) strncpy(g_webrtc_config.turn_server, turn_host, sizeof(g_webrtc_config.turn_server) - 1);
+    if (turn_user) strncpy(g_webrtc_config.turn_username, turn_user, sizeof(g_webrtc_config.turn_username) - 1);
+    if (turn_pass) strncpy(g_webrtc_config.turn_password, turn_pass, sizeof(g_webrtc_config.turn_password) - 1);
+
+    g_webrtc_enabled = webrtc_init(&g_webrtc_config);
+    if (g_webrtc_enabled) {
+        print_log("SUCCESS", "WebRTC 初始化成功");
+    } else {
+        print_log("WARNING", "WebRTC 初始化失败，将使用 WebSocket 模式");
+    }
+#endif
     
     print_log("INFO", "服务器地址: %s", server_url);
     
@@ -1051,6 +1083,73 @@ void handle_server_message(const char* message) {
             }
         }
     }
+#ifdef USE_WEBRTC
+    else if (strstr(message, "\"type\":\"webrtc-answer\"")) {
+        // WebRTC Answer from Web client
+        print_log("INFO", "[WebRTC] 收到 Answer");
+
+        char* device_id_start = strstr(message, "\"deviceId\":\"");
+        char* sdp_start = strstr(message, "\"sdp\":");
+
+        if (device_id_start && sdp_start) {
+            device_id_start += 12;
+            char* device_id_end = strchr(device_id_start, '"');
+            if (device_id_end) {
+                char device_id[256];
+                int len = device_id_end - device_id_start;
+                strncpy(device_id, device_id_start, len);
+                device_id[len] = '\0';
+
+                // 提取 SDP (简化处理，实际需要更复杂的 JSON 解析)
+                // SDP 格式: "sdp":{"type":"answer","sdp":"v=0..."}
+                char* sdp_value_start = strstr(sdp_start, "\"sdp\":\"");
+                if (sdp_value_start) {
+                    sdp_value_start += 7;
+                    // 找到 SDP 结束（简化：找最后一个引号前的内容）
+                    // 实际需要处理转义字符
+                    char sdp[4096];
+                    // 简化：直接设置远程描述
+                    print_log("INFO", "[WebRTC] 设置远程 Answer: %s", device_id);
+                    // webrtc_set_answer(device_id, sdp);
+                }
+            }
+        }
+    }
+    else if (strstr(message, "\"type\":\"webrtc-ice-candidate\"")) {
+        // WebRTC ICE Candidate
+        print_log("DEBUG", "[WebRTC] 收到 ICE Candidate");
+
+        char* device_id_start = strstr(message, "\"deviceId\":\"");
+        char* candidate_start = strstr(message, "\"candidate\":");
+
+        if (device_id_start && candidate_start) {
+            device_id_start += 12;
+            char* device_id_end = strchr(device_id_start, '"');
+            if (device_id_end) {
+                char device_id[256];
+                int len = device_id_end - device_id_start;
+                strncpy(device_id, device_id_start, len);
+                device_id[len] = '\0';
+
+                // 提取 candidate 字符串
+                char* cand_value_start = strstr(candidate_start, "\"candidate\":\"");
+                if (cand_value_start) {
+                    cand_value_start += 13;
+                    char* cand_end = strchr(cand_value_start, '"');
+                    if (cand_end) {
+                        char candidate[512];
+                        int clen = cand_end - cand_value_start;
+                        strncpy(candidate, cand_value_start, clen);
+                        candidate[clen] = '\0';
+
+                        print_log("DEBUG", "[WebRTC] 添加 ICE candidate: %s", device_id);
+                        // webrtc_add_ice_candidate(device_id, candidate);
+                    }
+                }
+            }
+        }
+    }
+#endif
 }
 
 // 停止设备推流
@@ -1221,7 +1320,15 @@ void console_loop() {
 
 void cleanup() {
     stop_all_devices();
-    
+
+#ifdef USE_WEBRTC
+    // 清理 WebRTC 资源
+    if (g_webrtc_enabled) {
+        webrtc_cleanup();
+        g_webrtc_enabled = false;
+    }
+#endif
+
     if (ws_socket != INVALID_SOCKET) {
         closesocket(ws_socket);
     }
