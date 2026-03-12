@@ -48,6 +48,38 @@
   - 用途: 线上部署 relay-server
   - 该服务器具有公网 IP，可作为 TURN 中继服务器
 
+### 线上服务器信息
+
+| 项目 | 值 |
+|------|-----|
+| 公网 IP | `42.193.18.13` |
+| Web 客户端 | `https://42.193.18.13:8443` |
+| HTTP 端点 (scrcpy) | `http://42.193.18.13:8080` |
+| 项目路径 | `/home/ubuntu/scrcpy-web/relay-server` |
+| PM2 应用名 | `scrcpy-relay-server` |
+
+### 服务器常用命令
+
+```bash
+# SSH 连接
+ssh ser-server
+
+# 查看服务状态
+pm2 status
+
+# 查看日志
+pm2 logs scrcpy-relay-server
+
+# 重启服务
+pm2 restart scrcpy-relay-server
+
+# 停止服务
+pm2 stop scrcpy-relay-server
+
+# 更新部署
+cd /home/ubuntu/scrcpy-web && git pull origin main && pm2 restart scrcpy-relay-server
+```
+
 ## 常用命令
 
 ### 中继服务器
