@@ -2,3 +2,4 @@ node_modules/
 cert/
 *.log
 .env
+device_aliases.json
