@@ -28,6 +28,7 @@ typedef struct {
     SOCKET control_socket;
     char serial[256];
     bool active;
+    bool first_frame_seen;
 } LocalScrcpyClient;
 
 static LocalScrcpyClient local_clients[MAX_LOCAL_CLIENTS];
@@ -76,6 +77,7 @@ static LocalScrcpyClient* create_local_client(const char* serial) {
             local_clients[i].video_socket = INVALID_SOCKET;
             local_clients[i].control_socket = INVALID_SOCKET;
             local_clients[i].active = true;
+            local_clients[i].first_frame_seen = false;
             if (i >= local_client_count) {
                 local_client_count = i + 1;
             }
@@ -376,6 +378,13 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
         frame_count++;
 
+        if (!client->first_frame_seen) {
+            client->first_frame_seen = true;
+            if (g_video_connect_callback) {
+                g_video_connect_callback(client->serial);
+            }
+        }
+
         // 通过 WebRTC DataChannel 发送
         char device_id[512];
         extern char client_id[64];
@@ -461,12 +470,8 @@ static unsigned __stdcall local_server_listener(void* param) {
                             closesocket(client->video_socket);
                         }
                         client->video_socket = client_sock;
+                        client->first_frame_seen = false;
                         print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
-
-                        // 调用回调通知主程序（触发 WebRTC Offer 创建）
-                        if (g_video_connect_callback) {
-                            g_video_connect_callback(serial);
-                        }
 
                         // 启动视频转发线程
                         HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, video_relay_thread, client, 0, NULL);

@@ -66,6 +66,7 @@ Device devices[MAX_DEVICES];
 int device_count = 0;
 bool running = true;
 char server_url[256] = "localhost:8080";
+static volatile LONG g_start_device_in_progress = 0;
 
 // 添加缩略图更新标志和线程相关变量
 bool thumbnail_update_pending = false;
@@ -816,12 +817,8 @@ void send_device_list() {
             escaped_name,
             devices[i].thumbnail_base64 ? devices[i].thumbnail_base64 : "");
 
-        print_log("DEBUG", "发送设备信息: %s", message);
-
         send_websocket_message(message);
         free(message);
-
-        print_log("INFO", "设备 %s 信息已发送到服务器", devices[i].serial);
     }
 }
 
@@ -840,6 +837,11 @@ unsigned __stdcall thumbnail_update_thread(void* param) {
     (void)param;
     
     while (running) {
+        if (InterlockedCompareExchange(&g_start_device_in_progress, 0, 0) == 1) {
+            Sleep(200);
+            continue;
+        }
+
         // 检查是否需要更新缩略图
         bool should_update = false;
         EnterCriticalSection(&thumbnail_cs);
@@ -1042,11 +1044,13 @@ void handle_server_message(const char* message) {
                 serial[len] = '\0';
                 
                 print_log("INFO", "服务器请求启动设备: %s", serial);
+                InterlockedExchange(&g_start_device_in_progress, 1);
                 
                 // 验证 serial 安全性
                 if (!is_valid_serial(serial)) {
                     print_log("ERROR", "无效的设备序列号: %s，拒绝启动", serial);
                     report_start_device_failed(serial, "invalid_serial", "设备序列号非法，已拒绝启动");
+                    InterlockedExchange(&g_start_device_in_progress, 0);
                     return;
                 }
 
@@ -1072,6 +1076,7 @@ void handle_server_message(const char* message) {
                 if (device_index < 0) {
                     print_log("ERROR", "设备不在当前ADB列表中: %s", serial);
                     report_start_device_failed(serial, "device_not_found", "设备不存在或已离线，请刷新后重试");
+                    InterlockedExchange(&g_start_device_in_progress, 0);
                     return;
                 }
 
@@ -1080,6 +1085,7 @@ void handle_server_message(const char* message) {
                     char fail_reason[256];
                     snprintf(fail_reason, sizeof(fail_reason), "设备状态为 %s，无法启动镜像", devices[device_index].state);
                     report_start_device_failed(serial, "device_not_ready", fail_reason);
+                    InterlockedExchange(&g_start_device_in_progress, 0);
                     return;
                 }
 
@@ -1100,6 +1106,7 @@ void handle_server_message(const char* message) {
                         "{\"type\":\"startStreaming\",\"serial\":\"%s\"}",
                         serial);
                     send_websocket_message(notify_msg);
+                    InterlockedExchange(&g_start_device_in_progress, 0);
                     return;
                 }
                 if (devices[device_index].streaming) {
@@ -1117,6 +1124,7 @@ void handle_server_message(const char* message) {
                 } else {
                     print_log("ERROR", "预注册设备推流失败: %s", serial);
                     report_start_device_failed(serial, "prepare_stream_failed", "预注册设备推流失败，请稍后重试");
+                    InterlockedExchange(&g_start_device_in_progress, 0);
                     return;
                 }
                 
@@ -1303,7 +1311,7 @@ void handle_server_message(const char* message) {
                     if (last_exit_code != 0) {
                         char fail_reason[384];
                         snprintf(fail_reason, sizeof(fail_reason),
-                            "scrcpy 启动即退出（exit=%lu），疑似设备编码器不兼容（MediaCodec configure失败）", last_exit_code);
+                            "scrcpy 启动即退出（exit=%lu），可能是 WebSocket 建链失败或设备编码器不兼容", last_exit_code);
                         report_start_device_failed(serial, "scrcpy_exit_early", fail_reason);
                     } else {
                         char fail_reason[256];
@@ -1311,6 +1319,7 @@ void handle_server_message(const char* message) {
                         report_start_device_failed(serial, "scrcpy_launch_failed", fail_reason);
                     }
                 }
+                InterlockedExchange(&g_start_device_in_progress, 0);
             } else {
                 print_log("ERROR", "无法解析设备序列号");
             }
@@ -1665,12 +1674,14 @@ void console_loop() {
             // 超时，定期扫描设备（但不阻塞）
             DWORD current_time = GetTickCount();
             if (current_time - last_device_scan > DEVICE_SCAN_INTERVAL) {
-                int new_count = scan_adb_devices();
-                if (new_count != device_count) {
-                    print_log("INFO", "设备列表已更新");
-                    send_device_list();  // 这会触发异步缩略图更新
+                if (InterlockedCompareExchange(&g_start_device_in_progress, 0, 0) != 1) {
+                    int new_count = scan_adb_devices();
+                    if (new_count != device_count) {
+                        print_log("INFO", "设备列表已更新");
+                        send_device_list();  // 这会触发异步缩略图更新
+                    }
+                    last_device_scan = current_time;
                 }
-                last_device_scan = current_time;
             }
         }
     }
@@ -1855,9 +1866,7 @@ void capture_device_screenshot(int device_index) {
     // 获取原始尺寸
     UINT width, height;
     pFrame->lpVtbl->GetSize(pFrame, &width, &height);
-    
-    print_log("INFO", "设备 %s 原始分辨率: %ux%u", device->serial, width, height);
-    
+
     // 计算缩略图尺寸
     UINT thumb_height = 160;
     UINT thumb_width = (UINT)((float)width / height * thumb_height);
