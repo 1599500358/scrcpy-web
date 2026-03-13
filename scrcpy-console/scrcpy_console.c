@@ -1118,17 +1118,56 @@ void handle_server_message(const char* message) {
                 strncpy(device_id, device_id_start, len);
                 device_id[len] = '\0';
 
-                // 提取 SDP (简化处理，实际需要更复杂的 JSON 解析)
-                // SDP 格式: "sdp":{"type":"answer","sdp":"v=0..."}
+                // 提取 SDP
+                // 格式: "sdp":{"type":"answer","sdp":"v=0\r\n..."}
                 char* sdp_value_start = strstr(sdp_start, "\"sdp\":\"");
                 if (sdp_value_start) {
                     sdp_value_start += 7;
-                    // 找到 SDP 结束（简化：找最后一个引号前的内容）
-                    // 实际需要处理转义字符
-                    char sdp[4096];
-                    // 简化：直接设置远程描述
-                    print_log("INFO", "[WebRTC] 设置远程 Answer: %s", device_id);
-                    // webrtc_set_answer(device_id, sdp);
+
+                    // 找到 SDP 结束位置 - 查找 "}," 或 "}" 作为结束
+                    char* sdp_end = strstr(sdp_value_start, "\"}}");
+                    if (!sdp_end) {
+                        sdp_end = strstr(sdp_value_start, "\"}");
+                    }
+                    if (!sdp_end) {
+                        // 回退：找最后一个引号
+                        char* last_quote = strrchr(sdp_value_start, '"');
+                        if (last_quote) {
+                            sdp_end = last_quote;
+                        }
+                    }
+
+                    if (sdp_end) {
+                        // 提取并反转义 SDP
+                        char* sdp = (char*)malloc(8192);
+                        if (sdp) {
+                            char* dst = sdp;
+                            char* src = sdp_value_start;
+                            while (src < sdp_end && (dst - sdp) < 8190) {
+                                if (*src == '\\' && *(src + 1) == 'r') {
+                                    *dst++ = '\r';
+                                    src += 2;
+                                } else if (*src == '\\' && *(src + 1) == 'n') {
+                                    *dst++ = '\n';
+                                    src += 2;
+                                } else if (*src == '\\' && *(src + 1) == '"') {
+                                    *dst++ = '"';
+                                    src += 2;
+                                } else if (*src == '\\' && *(src + 1) == '\\') {
+                                    *dst++ = '\\';
+                                    src += 2;
+                                } else {
+                                    *dst++ = *src++;
+                                }
+                            }
+                            *dst = '\0';
+
+                            print_log("INFO", "[WebRTC] 设置远程 Answer: %s, SDP长度: %d", device_id, (int)strlen(sdp));
+                            webrtc_set_answer(device_id, sdp);
+
+                            free(sdp);
+                        }
+                    }
                 }
             }
         }
@@ -1161,7 +1200,7 @@ void handle_server_message(const char* message) {
                         candidate[clen] = '\0';
 
                         print_log("DEBUG", "[WebRTC] 添加 ICE candidate: %s", device_id);
-                        // webrtc_add_ice_candidate(device_id, candidate);
+                        webrtc_add_ice_candidate(device_id, candidate);
                     }
                 }
             }
