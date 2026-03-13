@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm install)",
+      "Bash(ssh ser-server \"cd /home/ubuntu/scrcpy-web/relay-server && ls -la\")",
+      "Bash(scp /Users/pfc/Documents/scrcpy-web/relay-server/webrtc-signaling.js /Users/pfc/Documents/scrcpy-web/relay-server/turn-server.js /Users/pfc/Documents/scrcpy-web/relay-server/ecosystem.config.js ser-server:/home/ubuntu/scrcpy-web/relay-server/)"
+    ]
+  }
+}
