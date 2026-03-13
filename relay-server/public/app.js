@@ -27,6 +27,11 @@ let webrtcEnabled = false;
 let rtcConfig = null;
 let useWebRTC = false; // 是否使用 WebRTC 模式
 let pendingCandidates = []; // 缓存的 ICE candidates
+const WEBRTC_CHUNK_MAGIC = 0xA5;
+const WEBRTC_CHUNK_HEADER_SIZE = 6;
+let assemblingFrameId = null;
+let assemblingChunks = [];
+let assemblingSize = 0;
 
 // 初始化
 window.onload = async function() {
@@ -174,10 +179,63 @@ function setupDataChannel(channel, deviceId) {
             // 更新统计
             bytesReceived += event.data.byteLength;
 
-            // 复用现有的 H.264 解码逻辑
-            decodeH264Data(new Uint8Array(event.data));
+            // 兼容分片/非分片两种格式
+            handleIncomingVideoData(new Uint8Array(event.data));
         }
     };
+}
+
+function handleIncomingVideoData(buffer) {
+    if (buffer.length >= WEBRTC_CHUNK_HEADER_SIZE && buffer[0] === WEBRTC_CHUNK_MAGIC) {
+        const flags = buffer[1];
+        const frameId = (
+            buffer[2] |
+            (buffer[3] << 8) |
+            (buffer[4] << 16) |
+            (buffer[5] << 24)
+        ) >>> 0;
+        const isStart = (flags & 0x01) !== 0;
+        const isEnd = (flags & 0x02) !== 0;
+        const payload = buffer.subarray(WEBRTC_CHUNK_HEADER_SIZE);
+
+        if (isStart) {
+            assemblingFrameId = frameId;
+            assemblingChunks = [];
+            assemblingSize = 0;
+        }
+
+        if (assemblingFrameId !== frameId) {
+            return;
+        }
+
+        if (payload.length > 0) {
+            const copy = new Uint8Array(payload.length);
+            copy.set(payload);
+            assemblingChunks.push(copy);
+            assemblingSize += copy.length;
+        }
+
+        if (isEnd) {
+            let frameData;
+            if (assemblingChunks.length === 1) {
+                frameData = assemblingChunks[0];
+            } else {
+                frameData = new Uint8Array(assemblingSize);
+                let offset = 0;
+                for (const part of assemblingChunks) {
+                    frameData.set(part, offset);
+                    offset += part.length;
+                }
+            }
+
+            decodeH264Data(frameData);
+            resetWebRTCAssembler();
+        }
+        return;
+    }
+
+    // 兼容旧版未分片发送格式
+    decodeH264Data(buffer);
 }
 
 // 处理 WebRTC Offer
@@ -258,9 +316,16 @@ function closeWebRTC(silent = false) {
     }
     useWebRTC = false;
     pendingCandidates = [];
+    resetWebRTCAssembler();
     if (!silent) {
         console.log('[WebRTC] 连接已关闭');
     }
+}
+
+function resetWebRTCAssembler() {
+    assemblingFrameId = null;
+    assemblingChunks = [];
+    assemblingSize = 0;
 }
 
 // 初始化视频解码器
@@ -789,6 +854,7 @@ function selectDevice(deviceId, evt) {
 
     // 关闭之前的 WebRTC 连接（静默模式，因为可能立即建立新连接）
     closeWebRTC(true);
+    resetWebRTCAssembler();
 
     // 更新 UI
     document.querySelectorAll('.device-item').forEach(item => {
