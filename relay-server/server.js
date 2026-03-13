@@ -105,6 +105,7 @@ const pendingDeviceStreams = new Map(); // serial -> consoleId
 
 // 添加设备别名存储
 const deviceAliases = new Map();
+const deviceGroups = new Map();
 
 // 加载设备别名
 function loadDeviceAliases() {
@@ -142,6 +143,46 @@ function saveDeviceAliases() {
 
 // 初始化时加载设备别名
 loadDeviceAliases();
+
+// 加载设备分组
+function loadDeviceGroups() {
+    try {
+        if (fs.existsSync('device_groups.json')) {
+            const data = fs.readFileSync('device_groups.json', 'utf8');
+            const groups = JSON.parse(data);
+            for (const [serial, groupName] of Object.entries(groups)) {
+                const normalized = typeof groupName === 'string' ? groupName.trim() : '';
+                if (normalized) {
+                    deviceGroups.set(serial, normalized);
+                }
+            }
+            log('INFO', `[设备分组] 已加载 ${deviceGroups.size} 条分组记录`);
+        }
+    } catch (err) {
+        log('ERROR', '[设备分组] 加载设备分组失败:', err);
+    }
+}
+
+// 保存设备分组（带 debounce，避免频繁写文件）
+let _saveGroupsTimer = null;
+function saveDeviceGroups() {
+    if (_saveGroupsTimer) clearTimeout(_saveGroupsTimer);
+    _saveGroupsTimer = setTimeout(() => {
+        try {
+            const groups = {};
+            deviceGroups.forEach((value, key) => {
+                groups[key] = value;
+            });
+            fs.writeFileSync('device_groups.json', JSON.stringify(groups, null, 2));
+            log('INFO', '[设备分组] 设备分组已保存');
+        } catch (err) {
+            log('ERROR', '[设备分组] 保存设备分组失败:', err);
+        }
+    }, 1000);
+}
+
+// 初始化时加载设备分组
+loadDeviceGroups();
 
 // 配置会话中间件
 const sessionConfig = authManager.getSessionConfig();
@@ -446,6 +487,11 @@ function buildWebDeviceList() {
             deviceInfo.customName = deviceAliases.get(serial);
         } else if (device.customName) {
             deviceInfo.customName = device.customName;
+        }
+
+        const groupName = deviceGroups.get(serial) || device.groupName;
+        if (groupName && String(groupName).trim()) {
+            deviceInfo.groupName = String(groupName).trim();
         }
 
         allDevices.push(deviceInfo);
@@ -808,11 +854,17 @@ function handleConsoleMessage(consoleId, msg) {
             const oldDevices = consoleClient.devices;
             consoleClient.devices = new Map();
             
-            msg.devices.forEach(device => {
-                const oldDevice = oldDevices.get(device.serial);
-                // 保留所有设备属性，包括thumbnail和customName
-                consoleClient.devices.set(device.serial, {
-                    ...device,
+            msg.devices.forEach((incomingDevice) => {
+                const oldDevice = oldDevices.get(incomingDevice.serial);
+                const aliasName = deviceAliases.get(incomingDevice.serial);
+                const preservedName = aliasName || oldDevice?.customName || incomingDevice.customName;
+                const preservedGroup = deviceGroups.get(incomingDevice.serial) || oldDevice?.groupName || incomingDevice.groupName || '';
+
+                // 更新设备信息，但保留服务端名称（别名优先）
+                consoleClient.devices.set(incomingDevice.serial, {
+                    ...incomingDevice,
+                    customName: preservedName,
+                    groupName: preservedGroup,
                     consoleId: consoleId,
                     videoWs: oldDevice?.videoWs || null,
                     controlWs: oldDevice?.controlWs || null, // 也保留控制连接
@@ -822,7 +874,7 @@ function handleConsoleMessage(consoleId, msg) {
                 });
                 
                 // 添加调试信息
-                log('DEBUG', `[控制台] 设备 ${device.serial} 缩略图数据长度: ${device.thumbnail ? device.thumbnail.length : 0}`);
+                log('DEBUG', `[控制台] 设备 ${incomingDevice.serial} 缩略图数据长度: ${incomingDevice.thumbnail ? incomingDevice.thumbnail.length : 0}`);
             });
             
             log('INFO', `[控制台] ${consoleId} 更新了设备列表: ${msg.devices.length} 个设备`);
@@ -832,25 +884,31 @@ function handleConsoleMessage(consoleId, msg) {
         case 'deviceUpdate':
             // 更新单个设备信息
             if (msg.device) {
-                const device = msg.device;
-                const oldDevice = consoleClient.devices.get(device.serial);
-                
-                // 更新或添加设备信息
-                consoleClient.devices.set(device.serial, {
-                    ...device,
+                const incomingDevice = msg.device;
+                const oldDevice = consoleClient.devices.get(incomingDevice.serial);
+                const aliasName = deviceAliases.get(incomingDevice.serial);
+                const preservedName = aliasName || oldDevice?.customName || incomingDevice.customName;
+                const preservedGroup = deviceGroups.get(incomingDevice.serial) || oldDevice?.groupName || incomingDevice.groupName || '';
+
+                // 更新设备信息，但不覆盖设备名称（别名优先）
+                const mergedDevice = {
+                    ...incomingDevice,
+                    customName: preservedName,
+                    groupName: preservedGroup,
                     consoleId: consoleId,
                     videoWs: oldDevice?.videoWs || null,
                     controlWs: oldDevice?.controlWs || null,
                     status: oldDevice?.status || 'ready',
                     viewerCount: oldDevice?.viewerCount || 0,
                     lastActivityTime: oldDevice?.lastActivityTime || Date.now()
-                });
+                };
+                consoleClient.devices.set(incomingDevice.serial, mergedDevice);
                 
-                log('INFO', `[控制台] ${consoleId} 更新了设备 ${device.serial} 信息`);
-                log('DEBUG', `[控制台] 设备 ${device.serial} 缩略图数据长度: ${device.thumbnail ? device.thumbnail.length : 0}`);
+                log('INFO', `[控制台] ${consoleId} 更新了设备 ${incomingDevice.serial} 信息`);
+                log('DEBUG', `[控制台] 设备 ${incomingDevice.serial} 缩略图数据长度: ${incomingDevice.thumbnail ? incomingDevice.thumbnail.length : 0}`);
                 
                 // 广播更新到所有Web客户端
-                broadcastDeviceUpdateToWeb(device);
+                broadcastDeviceUpdateToWeb(mergedDevice);
             }
             break;
             
@@ -1176,6 +1234,33 @@ function handleWebMessage(clientId, msg) {
                 }
                 
                 // 广播更新后的设备列表
+                broadcastDeviceListToWeb();
+            }
+            break;
+
+        case 'updateDeviceGroup':
+            // 更新设备分组
+            if (msg.deviceId && typeof msg.groupName === 'string') {
+                const [consoleId, serial] = splitDeviceId(msg.deviceId);
+                const normalizedGroupName = msg.groupName.trim().slice(0, 40);
+
+                if (normalizedGroupName) {
+                    deviceGroups.set(serial, normalizedGroupName);
+                    log('INFO', `[Web客户端] ${clientId} 更新设备分组: ${serial} -> ${normalizedGroupName}`);
+                } else {
+                    deviceGroups.delete(serial);
+                    log('INFO', `[Web客户端] ${clientId} 清除设备分组: ${serial}`);
+                }
+                saveDeviceGroups();
+
+                const consoleClient = consoleClients.get(consoleId);
+                if (consoleClient) {
+                    const device = consoleClient.devices.get(serial);
+                    if (device) {
+                        device.groupName = normalizedGroupName;
+                    }
+                }
+
                 broadcastDeviceListToWeb();
             }
             break;

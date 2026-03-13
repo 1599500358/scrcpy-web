@@ -32,6 +32,101 @@ const WEBRTC_CHUNK_HEADER_SIZE = 6;
 let assemblingFrameId = null;
 let assemblingChunks = [];
 let assemblingSize = 0;
+let wsReconnectTimer = null;
+let authRedirecting = false;
+const MOBILE_LAYOUT_BREAKPOINT = 900;
+
+function isAuthFailureMessage(text) {
+    if (!text) return false;
+    const normalized = String(text).toLowerCase();
+    return normalized.includes('未授权') ||
+        normalized.includes('unauthorized') ||
+        normalized.includes('forbidden') ||
+        normalized.includes('auth');
+}
+
+function redirectToLogin(reason) {
+    if (authRedirecting) {
+        return;
+    }
+    authRedirecting = true;
+    console.warn('[AUTH] 会话失效，跳转登录页:', reason || 'unknown');
+    updateStatus(false, '会话已失效，正在跳转登录...');
+
+    if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
+    }
+
+    if (ws) {
+        try {
+            ws.onclose = null;
+            ws.close();
+        } catch (e) {
+            console.warn('[AUTH] 关闭WS失败(可忽略):', e);
+        }
+    }
+    ws = null;
+
+    closeWebRTC(true);
+    localStorage.removeItem('token');
+    localStorage.removeItem('username');
+    window.location.href = '/login';
+}
+
+async function checkSessionExpired() {
+    try {
+        const response = await fetch('/api/user', { cache: 'no-store' });
+        return response.status === 401 || response.status === 403;
+    } catch (e) {
+        return false;
+    }
+}
+
+function isMobileLayout() {
+    return window.innerWidth <= MOBILE_LAYOUT_BREAKPOINT;
+}
+
+function openMobileDevicePanel() {
+    if (!isMobileLayout()) {
+        return;
+    }
+    document.body.classList.add('mobile-sidebar-open');
+}
+
+function closeMobileDevicePanel() {
+    document.body.classList.remove('mobile-sidebar-open');
+}
+
+function initMobileUI() {
+    const openBtn = document.getElementById('openDevicePanelBtn');
+    const closeBtn = document.getElementById('closeDevicePanelBtn');
+    const backdrop = document.getElementById('mobileDrawerBackdrop');
+    const videoContainer = document.getElementById('videoContainer');
+
+    if (openBtn) {
+        openBtn.onclick = openMobileDevicePanel;
+    }
+    if (closeBtn) {
+        closeBtn.onclick = closeMobileDevicePanel;
+    }
+    if (backdrop) {
+        backdrop.onclick = closeMobileDevicePanel;
+    }
+    if (videoContainer) {
+        videoContainer.addEventListener('click', () => {
+            if (isMobileLayout()) {
+                closeMobileDevicePanel();
+            }
+        });
+    }
+
+    window.addEventListener('resize', () => {
+        if (!isMobileLayout()) {
+            closeMobileDevicePanel();
+        }
+    });
+}
 
 // 初始化
 window.onload = async function() {
@@ -52,9 +147,17 @@ window.onload = async function() {
 
     // 绑定登出按钮
     document.getElementById('logoutBtn').onclick = logout;
+    const username = localStorage.getItem('username');
+    if (username) {
+        const usernameEl = document.getElementById('username');
+        if (usernameEl) {
+            usernameEl.textContent = username;
+        }
+    }
 
     // 初始化触摸事件
     initTouchEvents();
+    initMobileUI();
 
     console.log('[INIT] 初始化完成, WebRTC:', webrtcEnabled ? '启用' : '禁用');
 };
@@ -74,6 +177,9 @@ async function fetchWebRTCConfig() {
                 };
                 console.log('[WebRTC] 配置获取成功, ICE Servers:', config.iceServers.length);
             }
+        } else if (response.status === 401 || response.status === 403) {
+            redirectToLogin(`fetch /api/webrtc-config ${response.status}`);
+            return;
         } else {
             console.log('[WebRTC] 获取配置失败，将使用 WebSocket 模式');
         }
@@ -451,6 +557,10 @@ function adjustCanvasSize() {
 
 // 连接 WebSocket
 function connectWebSocket() {
+    if (authRedirecting) {
+        return;
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}?type=web`; // 添加 type 参数
     
@@ -480,10 +590,26 @@ function connectWebSocket() {
         updateStatus(false, '连接错误');
     };
     
-    ws.onclose = () => {
-        console.log('[WS] 连接已关闭，3秒后重连...');
+    ws.onclose = async (event) => {
+        const reason = event.reason || '';
+
+        if (event.code === 1008 || isAuthFailureMessage(reason)) {
+            redirectToLogin(`ws_close code=${event.code}, reason=${reason || 'empty'}`);
+            return;
+        }
+
+        // 某些代理/网关下会表现为 1006，这里补一次会话探测
+        if (event.code === 1006) {
+            const expired = await checkSessionExpired();
+            if (expired) {
+                redirectToLogin('ws_close code=1006 + /api/user unauthorized');
+                return;
+            }
+        }
+
+        console.log(`[WS] 连接已关闭(code=${event.code}, reason=${reason || 'none'})，3秒后重连...`);
         updateStatus(false, '连接断开');
-        setTimeout(connectWebSocket, 3000);
+        wsReconnectTimer = setTimeout(connectWebSocket, 3000);
     };
 }
 
@@ -503,6 +629,10 @@ function handleTextMessage(data) {
                 updateSingleDevice(message.device);
                 break;
             case 'error':
+                if (isAuthFailureMessage(message.message)) {
+                    redirectToLogin(`ws_error_message: ${message.message}`);
+                    return;
+                }
                 showError(message.message);
                 break;
             case 'startDeviceFailed':
@@ -719,96 +849,149 @@ function nalToAVCC(nal) {
     return avcc;
 }
 
-// 更新设备列表
+function normalizeGroupName(groupName) {
+    const normalized = typeof groupName === 'string' ? groupName.trim() : '';
+    return normalized || '未分组';
+}
+
+function compareGroupName(a, b) {
+    if (a === b) return 0;
+    if (a === '未分组') return 1;
+    if (b === '未分组') return -1;
+    return a.localeCompare(b, 'zh-CN');
+}
+
+function createDeviceListItem(device) {
+    const li = document.createElement('li');
+    li.className = 'device-item';
+    li.dataset.deviceId = `${device.consoleId}:${device.serial}`;
+    
+    const thumbnailContainer = document.createElement('div');
+    thumbnailContainer.className = 'device-thumbnail';
+    
+    const thumbnail = document.createElement('img');
+    thumbnail.style.cssText = 'max-width: 100%; max-height: 100%; object-fit: contain;';
+    if (device.thumbnail) {
+        thumbnail.src = `data:image/jpeg;base64,${device.thumbnail}`;
+    } else {
+        thumbnail.style.display = 'none';
+        const placeholder = document.createElement('span');
+        placeholder.textContent = '无预览';
+        placeholder.style.cssText = 'color: #666; font-size: 12px;';
+        thumbnailContainer.appendChild(placeholder);
+    }
+    thumbnail.alt = device.customName || device.model;
+    thumbnailContainer.appendChild(thumbnail);
+    
+    const details = document.createElement('div');
+    details.className = 'device-details';
+    
+    const nameRow = document.createElement('div');
+    nameRow.className = 'device-name-row';
+    
+    const name = document.createElement('div');
+    name.className = 'device-name';
+    name.textContent = device.customName || device.model;
+    name.title = device.customName || device.model;
+
+    const actionWrap = document.createElement('div');
+    actionWrap.className = 'device-actions';
+    
+    const editBtn = document.createElement('button');
+    editBtn.className = 'edit-name-btn';
+    editBtn.textContent = '修改';
+    editBtn.onclick = (e) => {
+        e.stopPropagation();
+        openEditNameModal(device);
+    };
+
+    const groupBtn = document.createElement('button');
+    groupBtn.className = 'edit-name-btn group-btn';
+    groupBtn.textContent = '分组';
+    groupBtn.onclick = (e) => {
+        e.stopPropagation();
+        openEditGroupModal(device);
+    };
+
+    actionWrap.appendChild(editBtn);
+    actionWrap.appendChild(groupBtn);
+    
+    nameRow.appendChild(name);
+    nameRow.appendChild(actionWrap);
+    
+    const info = document.createElement('div');
+    info.className = 'device-info';
+    info.textContent = `Serial: ${device.serial.substring(0, 12)}...`;
+    
+    details.appendChild(nameRow);
+    details.appendChild(info);
+    
+    li.onclick = (evt) => selectDevice(`${device.consoleId}:${device.serial}`, evt);
+    
+    if (currentDevice === `${device.consoleId}:${device.serial}`) {
+        li.classList.add('selected');
+    }
+    
+    li.appendChild(thumbnailContainer);
+    li.appendChild(details);
+    return li;
+}
+
+// 更新设备列表（按分组展示）
 function updateDeviceList(devices) {
     const deviceList = document.getElementById('deviceList');
     const statsInfo = document.getElementById('statsInfo');
+    const mobileOpenBtn = document.getElementById('openDevicePanelBtn');
     
-    // 添加调试信息
     console.log('[DEVICE] 接收到设备列表:', devices);
     
     if (!devices || devices.length === 0) {
         deviceList.innerHTML = '<li class="no-device">等待控制台连接...</li>';
         statsInfo.textContent = '控制台: 0 | 设备: 0';
+        if (mobileOpenBtn) {
+            mobileOpenBtn.textContent = '📱 设备 (0)';
+        }
         return;
     }
     
-    // 统计控制台数量
     const consoles = new Set(devices.map(d => d.consoleId));
     statsInfo.textContent = `控制台: ${consoles.size} | 设备: ${devices.length}`;
+    if (mobileOpenBtn) {
+        mobileOpenBtn.textContent = `📱 设备 (${devices.length})`;
+    }
     
+    const groupedMap = new Map();
+    devices.forEach((device) => {
+        const groupName = normalizeGroupName(device.groupName);
+        if (!groupedMap.has(groupName)) {
+            groupedMap.set(groupName, []);
+        }
+        groupedMap.get(groupName).push(device);
+    });
+
+    const sortedGroupNames = Array.from(groupedMap.keys()).sort(compareGroupName);
     deviceList.innerHTML = '';
-    
-    devices.forEach(device => {
-        const li = document.createElement('li');
-        li.className = 'device-item';
-        li.dataset.deviceId = `${device.consoleId}:${device.serial}`;
-        
-        // 缩略图容器
-        const thumbnailContainer = document.createElement('div');
-        thumbnailContainer.className = 'device-thumbnail';
-        
-        // 缩略图
-        const thumbnail = document.createElement('img');
-        thumbnail.style.cssText = 'max-width: 100%; max-height: 100%; object-fit: contain;';
-        if (device.thumbnail) {
-            console.log(`[DEVICE] 设备 ${device.serial} 有缩略图数据，长度: ${device.thumbnail.length}`);
-            thumbnail.src = `data:image/jpeg;base64,${device.thumbnail}`;
-        } else {
-            console.log(`[DEVICE] 设备 ${device.serial} 没有缩略图数据`);
-            // 创建一个占位符文本
-            thumbnail.style.display = 'none';
-            const placeholder = document.createElement('span');
-            placeholder.textContent = '无预览';
-            placeholder.style.cssText = 'color: #666; font-size: 12px;';
-            thumbnailContainer.appendChild(placeholder);
-        }
-        thumbnail.alt = device.customName || device.model;
-        
-        thumbnailContainer.appendChild(thumbnail);
-        
-        // 设备详情
-        const details = document.createElement('div');
-        details.className = 'device-details';
-        
-        // 名称行
-        const nameRow = document.createElement('div');
-        nameRow.className = 'device-name-row';
-        
-        const name = document.createElement('div');
-        name.className = 'device-name';
-        name.textContent = device.customName || device.model;
-        name.title = device.customName || device.model;
-        
-        const editBtn = document.createElement('button');
-        editBtn.className = 'edit-name-btn';
-        editBtn.textContent = '修改';
-        editBtn.onclick = (e) => {
-            e.stopPropagation();
-            openEditNameModal(device);
-        };
-        
-        nameRow.appendChild(name);
-        nameRow.appendChild(editBtn);
-        
-        // 设备信息
-        const info = document.createElement('div');
-        info.className = 'device-info';
-        info.textContent = `Serial: ${device.serial.substring(0, 12)}...`;
-        
-        details.appendChild(nameRow);
-        details.appendChild(info);
-        
-        // 点击选择设备
-        li.onclick = () => selectDevice(`${device.consoleId}:${device.serial}`);
-        
-        if (currentDevice === `${device.consoleId}:${device.serial}`) {
-            li.classList.add('selected');
-        }
-        
-        li.appendChild(thumbnailContainer);
-        li.appendChild(details);
-        deviceList.appendChild(li);
+
+    sortedGroupNames.forEach((groupName) => {
+        const devicesInGroup = groupedMap.get(groupName) || [];
+        devicesInGroup.sort((a, b) => (a.customName || a.model || '').localeCompare((b.customName || b.model || ''), 'zh-CN'));
+
+        const groupBlock = document.createElement('li');
+        groupBlock.className = 'device-group-block';
+
+        const groupTitle = document.createElement('div');
+        groupTitle.className = 'device-group-title';
+        groupTitle.innerHTML = `<span>${groupName}</span><span class="device-group-count">${devicesInGroup.length} 台</span>`;
+
+        const groupList = document.createElement('ul');
+        groupList.className = 'device-group-list';
+        devicesInGroup.forEach((device) => {
+            groupList.appendChild(createDeviceListItem(device));
+        });
+
+        groupBlock.appendChild(groupTitle);
+        groupBlock.appendChild(groupList);
+        deviceList.appendChild(groupBlock);
     });
 }
 
@@ -834,16 +1017,14 @@ function updateSingleDevice(device) {
         li.querySelector('.device-thumbnail').appendChild(placeholder);
     }
     
-    // 更新名称
-    const name = li.querySelector('.device-name');
-    name.textContent = device.customName || device.model;
-    name.title = device.customName || device.model;
+    // 按需求：deviceUpdate 仅更新设备状态/缩略图，不更新设备名称
 }
 
 // 选择设备
 function selectDevice(deviceId, evt) {
     console.log('[DEVICE] 选择设备:', deviceId);
     currentDevice = deviceId;
+    closeMobileDevicePanel();
 
     // 重置解码器
     if (videoDecoder && videoDecoder.state !== 'unconfigured') {
@@ -1094,6 +1275,7 @@ window.addEventListener('resize', adjustCanvasSize);
 
 // 修改设备名称相关变量
 let editingDevice = null;
+let editingGroupDevice = null;
 
 // 打开修改设备名称模态框
 function openEditNameModal(device) {
@@ -1138,11 +1320,48 @@ function saveDeviceName() {
     closeEditNameModal();
 }
 
+// 打开修改设备分组模态框
+function openEditGroupModal(device) {
+    editingGroupDevice = device;
+    const modal = document.getElementById('editGroupModal');
+    const input = document.getElementById('deviceGroupInput');
+    input.value = device.groupName || '';
+    modal.classList.add('show');
+    input.focus();
+    input.select();
+}
+
+// 关闭修改设备分组模态框
+function closeEditGroupModal() {
+    const modal = document.getElementById('editGroupModal');
+    modal.classList.remove('show');
+    editingGroupDevice = null;
+}
+
+// 保存设备分组（留空表示未分组）
+function saveDeviceGroup() {
+    if (!editingGroupDevice) return;
+
+    const input = document.getElementById('deviceGroupInput');
+    const groupName = input.value.trim();
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'updateDeviceGroup',
+            deviceId: `${editingGroupDevice.consoleId}:${editingGroupDevice.serial}`,
+            groupName: groupName
+        }));
+        console.log('[DEVICE] 请求更新设备分组:', editingGroupDevice.serial, '->', groupName || '(未分组)');
+    }
+
+    closeEditGroupModal();
+}
+
 // 模态框背景点击关闭
 document.addEventListener('DOMContentLoaded', () => {
-    const modal = document.getElementById('editNameModal');
-    modal.addEventListener('click', (e) => {
-        if (e.target === modal) {
+    const nameModal = document.getElementById('editNameModal');
+    nameModal.addEventListener('click', (e) => {
+        if (e.target === nameModal) {
             closeEditNameModal();
         }
     });
@@ -1154,6 +1373,22 @@ document.addEventListener('DOMContentLoaded', () => {
             saveDeviceName();
         } else if (e.key === 'Escape') {
             closeEditNameModal();
+        }
+    });
+
+    const groupModal = document.getElementById('editGroupModal');
+    groupModal.addEventListener('click', (e) => {
+        if (e.target === groupModal) {
+            closeEditGroupModal();
+        }
+    });
+
+    const groupInput = document.getElementById('deviceGroupInput');
+    groupInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            saveDeviceGroup();
+        } else if (e.key === 'Escape') {
+            closeEditGroupModal();
         }
     });
 });

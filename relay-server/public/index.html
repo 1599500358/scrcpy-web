@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scrcpy 远程控制</title>
-    <link rel="stylesheet" href="responsive.css">
     <style>
         * {
             margin: 0;
@@ -39,6 +38,40 @@
         
         .header h1 {
             font-size: 24px;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+        }
+
+        .mobile-device-btn {
+            display: none;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+            background: #4f6df1;
+            cursor: pointer;
+        }
+
+        .mobile-close-btn {
+            display: none;
+            border: none;
+            border-radius: 999px;
+            padding: 6px 12px;
+            font-size: 12px;
+            color: #d7e4ff;
+            background: rgba(255, 255, 255, 0.16);
+            cursor: pointer;
+        }
+
+        .mobile-drawer-backdrop {
+            display: none;
         }
         
         .status {
@@ -109,9 +142,16 @@
             padding-bottom: 10px;
             border-bottom: 2px solid #667eea;
         }
+
+        .sidebar-title-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
         
         .device-list {
             list-style: none;
+            display: block;
         }
         
         .device-item {
@@ -160,6 +200,13 @@
             gap: 8px;
             margin-bottom: 5px;
         }
+
+        .device-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
         
         .device-name {
             font-weight: bold;
@@ -183,6 +230,42 @@
         
         .edit-name-btn:hover {
             background: #5568d3;
+        }
+
+        .group-btn {
+            background: #0f9d8a;
+        }
+
+        .group-btn:hover {
+            background: #0b7f70;
+        }
+
+        .device-group-block {
+            margin-bottom: 12px;
+        }
+
+        .device-group-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            padding: 6px 8px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            font-size: 12px;
+            font-weight: 600;
+            color: #d4e0ff;
+        }
+
+        .device-group-count {
+            color: #a9b7d8;
+            font-size: 11px;
+        }
+
+        .device-group-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
         }
         
         .device-info {
@@ -400,12 +483,232 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+
+        @media (max-width: 900px) {
+            body {
+                padding: 0;
+                background: radial-gradient(circle at 20% 10%, #6b8eff 0%, #2d3857 45%, #151b2b 100%);
+                min-height: 100dvh;
+            }
+
+            .container {
+                max-width: none;
+                min-height: 100dvh;
+                border-radius: 0;
+                box-shadow: none;
+                background: #0f1525;
+            }
+
+            .header {
+                position: sticky;
+                top: 0;
+                z-index: 20;
+                padding: 10px 12px;
+                background: rgba(17, 24, 39, 0.96);
+                backdrop-filter: blur(10px);
+            }
+
+            .header h1 {
+                font-size: 15px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .mobile-device-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .user-info {
+                gap: 8px;
+            }
+
+            .status {
+                gap: 6px;
+                font-size: 12px;
+            }
+
+            .status-dot {
+                width: 9px;
+                height: 9px;
+            }
+
+            .username {
+                font-size: 12px;
+                max-width: 70px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .logout-btn {
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+
+            .main-content {
+                height: calc(100dvh - 58px);
+            }
+
+            .viewer {
+                background: #0f1525;
+                padding: 8px 8px calc(env(safe-area-inset-bottom) + 78px);
+            }
+
+            .video-container {
+                border-radius: 14px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                background: #000;
+            }
+
+            .sidebar {
+                position: fixed;
+                top: 58px;
+                left: 0;
+                bottom: 0;
+                width: min(88vw, 360px);
+                z-index: 31;
+                transform: translateX(-105%);
+                transition: transform 0.22s ease;
+                padding: 14px;
+                background: linear-gradient(180deg, #1e2c45 0%, #162238 100%);
+                border-right: 1px solid rgba(255, 255, 255, 0.12);
+            }
+
+            body.mobile-sidebar-open .sidebar {
+                transform: translateX(0);
+            }
+
+            .mobile-close-btn {
+                display: inline-block;
+            }
+
+            .sidebar h2 {
+                margin-bottom: 10px;
+                padding-bottom: 0;
+                border-bottom: none;
+            }
+
+            .device-item {
+                display: flex;
+                flex-direction: row;
+                align-items: center;
+                border-radius: 10px;
+                padding: 9px;
+                margin-bottom: 8px;
+            }
+
+            .device-item:hover {
+                transform: none;
+            }
+
+            .device-thumbnail {
+                width: 92px;
+                height: 62px;
+            }
+
+            .device-name {
+                font-size: 13px;
+            }
+
+            .device-info {
+                font-size: 11px;
+            }
+
+            .edit-name-btn {
+                font-size: 10px;
+                padding: 3px 7px;
+            }
+
+            .device-actions {
+                gap: 5px;
+            }
+
+            .device-group-title {
+                font-size: 11px;
+                padding: 5px 7px;
+            }
+
+            .controls {
+                display: flex;
+                position: fixed;
+                left: 8px;
+                right: 8px;
+                bottom: calc(env(safe-area-inset-bottom) + 8px);
+                z-index: 22;
+                min-height: auto;
+                padding: 8px;
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                background: rgba(16, 24, 40, 0.82);
+                backdrop-filter: blur(8px);
+                overflow-x: auto;
+                gap: 6px;
+                scrollbar-width: none;
+            }
+
+            .controls::-webkit-scrollbar {
+                display: none;
+            }
+
+            .btn {
+                flex: 0 0 auto;
+                min-width: 74px;
+                padding: 8px 10px;
+                border-radius: 9px;
+                font-size: 11px;
+            }
+
+            .no-device {
+                font-size: 15px;
+                padding: 0 14px;
+            }
+
+            .loading {
+                font-size: 14px;
+            }
+
+            .spinner {
+                width: 30px;
+                height: 30px;
+                border-width: 3px;
+            }
+
+            .mobile-drawer-backdrop {
+                position: fixed;
+                top: 58px;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                z-index: 30;
+                background: rgba(0, 0, 0, 0.38);
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.2s ease;
+                display: block;
+            }
+
+            body.mobile-sidebar-open .mobile-drawer-backdrop {
+                opacity: 1;
+                pointer-events: auto;
+            }
+
+            .modal-content {
+                width: calc(100% - 24px);
+                padding: 18px;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎮 Scrcpy 远程控制系统</h1>
+            <div class="header-left">
+                <button class="mobile-device-btn" id="openDevicePanelBtn" type="button">📱 设备</button>
+                <h1>🎮 Scrcpy 远程控制系统</h1>
+            </div>
             <div class="user-info">
                 <div class="status">
                     <div class="status-dot" id="statusDot"></div>
@@ -415,10 +718,15 @@
                 <button class="logout-btn" id="logoutBtn">退出登录</button>
             </div>
         </div>
+
+        <div class="mobile-drawer-backdrop" id="mobileDrawerBackdrop"></div>
         
         <div class="main-content">
             <div class="sidebar">
-                <h2>📱 可用设备</h2>
+                <div class="sidebar-title-row">
+                    <h2>📱 可用设备</h2>
+                    <button class="mobile-close-btn" id="closeDevicePanelBtn" type="button">收起</button>
+                </div>
                 <ul class="device-list" id="deviceList">
                     <li class="no-device">等待控制台连接...</li>
                 </ul>
@@ -442,6 +750,7 @@
                     <button class="btn" onclick="sendControl('home')">🏠 主页</button>
                     <button class="btn" onclick="sendControl('back')">⬅️ 返回</button>
                     <button class="btn" onclick="sendControl('recent')">📋 最近任务</button>
+                    <button class="btn" onclick="sendControl('rotate')">🔄 旋转</button>
                     <button class="btn" onclick="sendControl('power')">🔌 电源</button>
                     <button class="btn" onclick="sendControl('volumeUp')">🔊 音量+</button>
                     <button class="btn" onclick="sendControl('volumeDown')">🔉 音量-</button>
@@ -461,6 +770,19 @@
             <div class="modal-footer">
                 <button class="modal-btn secondary" onclick="closeEditNameModal()">取消</button>
                 <button class="modal-btn primary" onclick="saveDeviceName()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="editGroupModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">设置设备分组</div>
+            <div class="modal-body">
+                <input type="text" id="deviceGroupInput" class="modal-input" placeholder="输入分组名，留空表示未分组" maxlength="40">
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn secondary" onclick="closeEditGroupModal()">取消</button>
+                <button class="modal-btn primary" onclick="saveDeviceGroup()">保存</button>
             </div>
         </div>
     </div>
