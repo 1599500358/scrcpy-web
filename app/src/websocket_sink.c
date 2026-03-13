@@ -1,6 +1,7 @@
 #include "websocket_sink.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -150,28 +151,35 @@ handle_control_message(struct sc_websocket_sink *ws, const char *message) {
             // LOGI("Touch: type=%s, pos=(%d,%d), screen=%dx%d", 
             //      touchType, x_abs, y_abs, video_width, video_height);
             
-            // 构造触摸事件
+            // 构造触摸事件（按“手指触控”语义注入，而不是鼠标语义）
             msg.type = SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
-            msg.inject_touch_event.pointer_id = SC_POINTER_ID_MOUSE;
+            msg.inject_touch_event.pointer_id = SC_POINTER_ID_GENERIC_FINGER;
             msg.inject_touch_event.position.point.x = x_abs;
             msg.inject_touch_event.position.point.y = y_abs;
             msg.inject_touch_event.position.screen_size.width = video_width;
             msg.inject_touch_event.position.screen_size.height = video_height;
-            msg.inject_touch_event.pressure = 1.0f;
             msg.inject_touch_event.action_button = 0;
             msg.inject_touch_event.buttons = 0;
             
             if (strcmp(touchType, "down") == 0) {
                 msg.inject_touch_event.action = AMOTION_EVENT_ACTION_DOWN;
+                msg.inject_touch_event.pressure = 1.0f;
             } else if (strcmp(touchType, "move") == 0) {
                 msg.inject_touch_event.action = AMOTION_EVENT_ACTION_MOVE;
+                msg.inject_touch_event.pressure = 1.0f;
             } else if (strcmp(touchType, "up") == 0) {
                 msg.inject_touch_event.action = AMOTION_EVENT_ACTION_UP;
+                msg.inject_touch_event.pressure = 0.0f;
             } else {
                 return;
             }
-            
-            sc_controller_push_msg(ws->controller, &msg);
+
+            bool pushed = sc_controller_push_msg(ws->controller, &msg);
+            if (!pushed) {
+                LOGW("Touch control push failed: type=%s", touchType);
+            } else if (strcmp(touchType, "move") != 0) {
+                LOGI("Touch control pushed: type=%s x=%d y=%d", touchType, x_abs, y_abs);
+            }
         }
     }
 }
@@ -214,7 +222,9 @@ websocket_send_binary(sc_socket socket, const uint8_t *data, size_t len) {
     }
     
     // 发送头部
-    send(socket, (char*)header, header_len, 0);
+    if (net_send_all(socket, header, header_len) != (ssize_t) header_len) {
+        return;
+    }
     
     // 优化的 masking：使用 4 字节对齐处理
     if (len < 8192) {
@@ -232,7 +242,7 @@ websocket_send_binary(sc_socket socket, const uint8_t *data, size_t len) {
             masked_data[i] = data[i] ^ masking_key[i % 4];
         }
         
-        send(socket, (char*)masked_data, len, 0);
+        net_send_all(socket, masked_data, len);
     } else {
         uint8_t *masked_data = malloc(len);
         if (masked_data) {
@@ -249,46 +259,121 @@ websocket_send_binary(sc_socket socket, const uint8_t *data, size_t len) {
                 masked_data[i] = data[i] ^ masking_key[i % 4];
             }
             
-            send(socket, (char*)masked_data, len, 0);
+            net_send_all(socket, masked_data, len);
             free(masked_data);
         }
     }
 }
 
+// 读取一个完整的 WebSocket 帧（用于控制消息）
+// 返回 payload 长度，失败返回 -1
+static ssize_t
+websocket_recv_frame(sc_socket socket, uint8_t *payload, size_t payload_cap, uint8_t *opcode_out) {
+    uint8_t header[2];
+    ssize_t r = net_recv_all(socket, header, sizeof(header));
+    if (r != (ssize_t) sizeof(header)) {
+        return -1;
+    }
+
+    uint8_t opcode = header[0] & 0x0F;
+    bool masked = (header[1] & 0x80) != 0;
+    uint64_t payload_len = header[1] & 0x7F;
+
+    if (payload_len == 126) {
+        uint8_t ext[2];
+        if (net_recv_all(socket, ext, sizeof(ext)) != (ssize_t) sizeof(ext)) {
+            return -1;
+        }
+        payload_len = ((uint64_t) ext[0] << 8) | ext[1];
+    } else if (payload_len == 127) {
+        uint8_t ext[8];
+        if (net_recv_all(socket, ext, sizeof(ext)) != (ssize_t) sizeof(ext)) {
+            return -1;
+        }
+        payload_len = 0;
+        for (int i = 0; i < 8; ++i) {
+            payload_len = (payload_len << 8) | ext[i];
+        }
+    }
+
+    uint8_t mask[4] = {0};
+    if (masked) {
+        if (net_recv_all(socket, mask, sizeof(mask)) != (ssize_t) sizeof(mask)) {
+            return -1;
+        }
+    }
+
+    if (payload_len >= payload_cap) {
+        LOGW("Control frame too large: %llu (cap=%u)",
+             (unsigned long long) payload_len, (unsigned) payload_cap);
+        // 丢弃超长负载，保持流同步
+        uint8_t dump[256];
+        uint64_t remaining = payload_len;
+        while (remaining > 0) {
+            size_t chunk = remaining > sizeof(dump) ? sizeof(dump) : (size_t) remaining;
+            if (net_recv_all(socket, dump, chunk) != (ssize_t) chunk) {
+                return -1;
+            }
+            remaining -= chunk;
+        }
+        return -1;
+    }
+
+    if (payload_len > 0) {
+        if (net_recv_all(socket, payload, (size_t) payload_len) != (ssize_t) payload_len) {
+            return -1;
+        }
+        if (masked) {
+            for (uint64_t i = 0; i < payload_len; ++i) {
+                payload[i] ^= mask[i % 4];
+            }
+        }
+    }
+
+    payload[payload_len] = '\0';
+    if (opcode_out) {
+        *opcode_out = opcode;
+    }
+    return (ssize_t) payload_len;
+}
+
 // 连接到中继服务器（通用函数）
 static sc_socket
 connect_to_server(const char *host, const char *port, const char *path, const char *serial) {
+    (void) serial;
     LOGI("Connecting to relay server %s:%s%s", host, port, path);
     
     // 创建 socket
-    sc_socket sock = socket(AF_INET, SOCK_STREAM, 0);
+    sc_socket sock = net_socket();
     if (sock == SC_SOCKET_NONE) {
         LOGE("Could not create WebSocket client socket");
         return SC_SOCKET_NONE;
     }
     
-    // 解析地址
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(atoi(port));
-    
-    if (strcmp(host, "localhost") == 0) {
-        server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    } else {
-        server_addr.sin_addr.s_addr = inet_addr(host);
+    uint32_t ipv4;
+    const char *ip = strcmp(host, "localhost") == 0 ? "127.0.0.1" : host;
+    if (!net_parse_ipv4(ip, &ipv4)) {
+        LOGE("Invalid relay host: %s", host);
+        net_close(sock);
+        return SC_SOCKET_NONE;
     }
-    
+
+    int port_int = atoi(port);
+    if (port_int <= 0 || port_int > 65535) {
+        LOGE("Invalid relay port: %s", port);
+        net_close(sock);
+        return SC_SOCKET_NONE;
+    }
+
     // 连接
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    if (!net_connect(sock, ipv4, (uint16_t) port_int)) {
         LOGE("Could not connect to relay server %s:%s", host, port);
         net_close(sock);
         return SC_SOCKET_NONE;
     }
     
     // 设置 TCP_NODELAY 减少延迟
-    int flag = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
+    (void) net_set_tcp_nodelay(sock, true);
     
     // 发送 WebSocket 握手
     char handshake[1024];
@@ -302,7 +387,8 @@ connect_to_server(const char *host, const char *port, const char *path, const ch
         "\r\n",
         path, host);
     
-    if (send(sock, handshake, strlen(handshake), 0) <= 0) {
+    size_t handshake_len = strlen(handshake);
+    if (net_send_all(sock, handshake, handshake_len) != (ssize_t) handshake_len) {
         LOGE("Failed to send WebSocket handshake");
         net_close(sock);
         return SC_SOCKET_NONE;
@@ -310,7 +396,7 @@ connect_to_server(const char *host, const char *port, const char *path, const ch
     
     // 接收响应
     char response[1024];
-    ssize_t received = recv(sock, response, sizeof(response) - 1, 0);
+    ssize_t received = net_recv(sock, response, sizeof(response) - 1);
     if (received <= 0) {
         LOGE("Failed to receive WebSocket handshake response");
         net_close(sock);
@@ -392,7 +478,7 @@ run_websocket_thread(void *data) {
     LOGI("WebSocket dual connections ready for device: %s", ws->device_serial);
     
     // 接收控制消息（只从 control_socket 接收）
-    char buffer[4096];
+    uint8_t buffer[4096];
     while (!ws->stopped) {
         // 如果控制连接不可用，等待后重试
         if (ws->control_socket == SC_SOCKET_NONE) {
@@ -403,46 +489,33 @@ run_websocket_thread(void *data) {
 #endif
             continue;
         }
-        
-        // 使用短超时检查控制消息
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 10000; // 10ms
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(ws->control_socket, &read_fds);
-        
-        int result = select(ws->control_socket + 1, &read_fds, NULL, NULL, &tv);
-        if (result > 0 && FD_ISSET(ws->control_socket, &read_fds)) {
-            ssize_t received = recv(ws->control_socket, buffer, sizeof(buffer) - 1, 0);
-            if (received <= 0) {
-                LOGW("Control socket closed, reconnecting...");
-                net_close(ws->control_socket);
-                ws->control_socket = SC_SOCKET_NONE;
-                sc_mutex_lock(&ws->mutex);
-                ws->control_connected = false;
-                sc_mutex_unlock(&ws->mutex);
-                continue;
+
+        uint8_t opcode = 0;
+        ssize_t payload_len =
+            websocket_recv_frame(ws->control_socket, buffer, sizeof(buffer), &opcode);
+        if (payload_len < 0) {
+            if (ws->stopped) {
+                break;
             }
-            
-            // 解析 WebSocket 帧（简化版，只处理文本帧）
-            if (received > 2 && (buffer[0] & 0x0F) == 0x01) { // Text frame
-                int payload_len = buffer[1] & 0x7F;
-                int offset = 2;
-                
-                if (payload_len == 126) {
-                    payload_len = (buffer[2] << 8) | buffer[3];
-                    offset = 4;
-                } else if (payload_len == 127) {
-                    offset = 10;
-                }
-                
-                if (received > offset && payload_len > 0 && payload_len < (int)sizeof(buffer)) {
-                    buffer[offset + payload_len] = '\0';
-                    // 移除日志：LOGD("Received message: %s", buffer + offset);
-                    handle_control_message(ws, buffer + offset);
-                }
-            }
+
+            LOGW("Control socket closed, reconnecting...");
+            net_close(ws->control_socket);
+            ws->control_socket = SC_SOCKET_NONE;
+            sc_mutex_lock(&ws->mutex);
+            ws->control_connected = false;
+            sc_mutex_unlock(&ws->mutex);
+            continue;
+        }
+
+        if (opcode == 0x01 && payload_len > 0) { // Text frame
+            handle_control_message(ws, (const char *) buffer);
+        } else if (opcode == 0x08) { // Close
+            LOGW("Control socket sent close frame");
+            net_close(ws->control_socket);
+            ws->control_socket = SC_SOCKET_NONE;
+            sc_mutex_lock(&ws->mutex);
+            ws->control_connected = false;
+            sc_mutex_unlock(&ws->mutex);
         }
     }
     
@@ -503,14 +576,25 @@ sc_websocket_sink_close(struct sc_websocket_sink *ws) {
     sc_mutex_unlock(&ws->mutex);
     
     if (ws->video_socket != SC_SOCKET_NONE) {
-        net_close(ws->video_socket);
+        net_interrupt(ws->video_socket);
     }
     
     if (ws->control_socket != SC_SOCKET_NONE) {
-        net_close(ws->control_socket);
+        net_interrupt(ws->control_socket);
     }
     
     sc_thread_join(&ws->thread, NULL);
+
+    if (ws->video_socket != SC_SOCKET_NONE) {
+        net_close(ws->video_socket);
+        ws->video_socket = SC_SOCKET_NONE;
+    }
+
+    if (ws->control_socket != SC_SOCKET_NONE) {
+        net_close(ws->control_socket);
+        ws->control_socket = SC_SOCKET_NONE;
+    }
+
     sc_mutex_destroy(&ws->mutex);
     
     LOGI("WebSocket sink closed");
