@@ -366,34 +366,92 @@ app.get('/api/devices', authManager.requireAuth, (req, res) => {
 });
 
 // 辅助函数：查找设备（支持 IP 地址模糊匹配）
+function getConsolePriority(consoleClient) {
+    const isOpen = !!(consoleClient && consoleClient.ws && consoleClient.ws.readyState === WebSocket.OPEN);
+    const connectedAtMs = Date.parse(consoleClient?.connectedAt || '') || 0;
+    return (isOpen ? 1e15 : 0) + connectedAtMs;
+}
+
 function findDeviceBySerial(serial) {
-    let foundDevice = null;
-    let foundConsoleId = null;
-    let matchedSerial = null;
-    
-    consoleClients.forEach((consoleClient, consoleId) => {
-        // 先尝试精确匹配
-        if (consoleClient.devices.has(serial)) {
-            foundDevice = consoleClient.devices.get(serial);
-            foundConsoleId = consoleId;
-            matchedSerial = serial;
-            return;
+    let bestMatch = null;
+
+    function considerCandidate(consoleClient, consoleId, deviceSerial, device) {
+        const priority = getConsolePriority(consoleClient);
+        if (!bestMatch || priority >= bestMatch.priority) {
+            bestMatch = {
+                device,
+                consoleId,
+                serial: deviceSerial,
+                priority
+            };
         }
-        
-        // 如果是 IP 地址，尝试模糊匹配（支持无线调试）
-        // 例如：scrcpy 发送 "192.168.0.6"，控制台有 "192.168.0.6:39743"
+    }
+
+    consoleClients.forEach((consoleClient, consoleId) => {
+        if (consoleClient.devices.has(serial)) {
+            considerCandidate(consoleClient, consoleId, serial, consoleClient.devices.get(serial));
+        }
+
         if (serial && serial.match(/^\d+\.\d+\.\d+\.\d+$/)) {
             consoleClient.devices.forEach((device, deviceSerial) => {
                 if (deviceSerial.startsWith(serial + ':')) {
-                    foundDevice = device;
-                    foundConsoleId = consoleId;
-                    matchedSerial = deviceSerial;
+                    considerCandidate(consoleClient, consoleId, deviceSerial, device);
                 }
             });
         }
     });
-    
-    return { device: foundDevice, consoleId: foundConsoleId, serial: matchedSerial };
+
+    if (bestMatch) {
+        return {
+            device: bestMatch.device,
+            consoleId: bestMatch.consoleId,
+            serial: bestMatch.serial
+        };
+    }
+
+    return { device: null, consoleId: null, serial: null };
+}
+
+function buildWebDeviceList() {
+    const bySerial = new Map(); // serial -> { device, consoleId, priority }
+
+    consoleClients.forEach((consoleClient, consoleId) => {
+        consoleClient.devices.forEach((device, serial) => {
+            const priority = getConsolePriority(consoleClient);
+            const existing = bySerial.get(serial);
+            if (!existing || priority >= existing.priority) {
+                bySerial.set(serial, { device, consoleId, priority });
+            }
+        });
+    });
+
+    const allDevices = [];
+    bySerial.forEach((entry, serial) => {
+        const { device, consoleId } = entry;
+        const deviceInfo = {
+            id: `${consoleId}:${serial}`,
+            serial: device.serial || serial,
+            model: device.model,
+            state: device.state,
+            status: device.status,
+            consoleId
+        };
+
+        if (device.thumbnail) {
+            deviceInfo.thumbnail = device.thumbnail;
+            log('DEBUG', `[WS] 发送设备 ${serial} 缩略图数据，长度: ${device.thumbnail.length}`);
+        }
+
+        if (deviceAliases.has(serial)) {
+            deviceInfo.customName = deviceAliases.get(serial);
+        } else if (device.customName) {
+            deviceInfo.customName = device.customName;
+        }
+
+        allDevices.push(deviceInfo);
+    });
+
+    return allDevices;
 }
 
 // 辅助函数：拆分设备 ID（支持带端口的 IP 地址）
@@ -906,10 +964,30 @@ function handleWebMessage(clientId, msg) {
                 break;
             }
 
-            const [consoleId, serial] = splitDeviceId(msg.deviceId);
-            log('DEBUG', `[Web客户端] 解析设备ID: consoleId=${consoleId}, serial=${serial}`);
+            const [requestedConsoleId, requestedSerial] = splitDeviceId(msg.deviceId);
+            log('DEBUG', `[Web客户端] 解析设备ID: consoleId=${requestedConsoleId}, serial=${requestedSerial}`);
 
-            const consoleClient = consoleClients.get(consoleId);
+            // 优先按 serial 解析到当前在线且最新的控制台，避免旧 consoleId 缓存导致发错目标
+            const resolved = findDeviceBySerial(requestedSerial);
+            let consoleId = requestedConsoleId;
+            let serial = requestedSerial;
+            let consoleClient = consoleClients.get(consoleId);
+            let device = consoleClient ? consoleClient.devices.get(serial) : null;
+
+            if (resolved.device && resolved.consoleId) {
+                const requestedReady = !!(consoleClient &&
+                    device &&
+                    consoleClient.ws &&
+                    consoleClient.ws.readyState === WebSocket.OPEN);
+                if (!requestedReady || resolved.consoleId !== requestedConsoleId) {
+                    consoleId = resolved.consoleId;
+                    serial = resolved.serial || requestedSerial;
+                    consoleClient = consoleClients.get(consoleId);
+                    device = resolved.device;
+                    log('INFO', `[Web客户端] 设备路由已重定向: ${requestedConsoleId}:${requestedSerial} -> ${consoleId}:${serial}`);
+                }
+            }
+
             if (!consoleClient) {
                 webClient.currentDevice = null;
                 log('WARN', `[Web客户端] 未找到控制台客户端: ${consoleId}`);
@@ -924,7 +1002,6 @@ function handleWebMessage(clientId, msg) {
                 break;
             }
 
-            const device = consoleClient.devices.get(serial);
             if (!device) {
                 webClient.currentDevice = null;
                 log('WARN', `[Web客户端] 选择的设备不存在于控制台缓存: ${msg.deviceId}`);
@@ -952,8 +1029,9 @@ function handleWebMessage(clientId, msg) {
             }
 
             // 验证通过后，才设置当前观看设备并加入索引
-            webClient.currentDevice = msg.deviceId;
-            addViewerToIndex(msg.deviceId, webClient.ws);
+            const routedDeviceId = `${consoleId}:${serial}`;
+            webClient.currentDevice = routedDeviceId;
+            addViewerToIndex(routedDeviceId, webClient.ws);
 
             // 避免重复启动：设备已在推流时无需再次拉起 scrcpy
             if (device.videoWs && device.videoWs.readyState === WebSocket.OPEN) {
@@ -969,11 +1047,11 @@ function handleWebMessage(clientId, msg) {
                 log('INFO', `[Web客户端] 已发送startDevice消息到控制台: ${consoleId}`);
             } else {
                 webClient.currentDevice = null;
-                removeViewerFromIndex(msg.deviceId, webClient.ws);
+                removeViewerFromIndex(routedDeviceId, webClient.ws);
                 log('WARN', `[Web客户端] 控制台连接状态异常: ${consoleClient.ws.readyState}`);
                 sendWsJson(webClient.ws, {
                     type: 'startDeviceFailed',
-                    deviceId: msg.deviceId,
+                    deviceId: routedDeviceId,
                     serial,
                     reason: 'console_ws_unavailable',
                     message: '控制台连接异常，无法下发启动指令'
@@ -1145,38 +1223,8 @@ function removeViewerFromIndex(deviceId, ws) {
 
 // 向单个 Web 客户端发送设备列表
 function sendDeviceListToWeb(ws) {
-    const allDevices = [];
-    consoleClients.forEach((client, consoleId) => {
-        client.devices.forEach((device, serial) => {
-            // 创建一个包含所有设备信息的对象，包括缩略图
-            const deviceInfo = {
-                id: `${consoleId}:${serial}`,
-                serial: device.serial,
-                model: device.model,
-                state: device.state,
-                status: device.status,
-                consoleId: consoleId
-            };
-            
-            // 如果设备有缩略图数据，也包含在内
-            if (device.thumbnail) {
-                deviceInfo.thumbnail = device.thumbnail;
-                log('DEBUG', `[WS] 发送设备 ${serial} 缩略图数据，长度: ${device.thumbnail.length}`);
-            }
-            
-            // 检查服务端是否有设备别名
-            if (deviceAliases.has(serial)) {
-                deviceInfo.customName = deviceAliases.get(serial);
-            }
-            // 如果没有服务端别名，但设备本身有自定义名称，也包含在内
-            else if (device.customName) {
-                deviceInfo.customName = device.customName;
-            }
-            
-            allDevices.push(deviceInfo);
-        });
-    });
-    
+    const allDevices = buildWebDeviceList();
+
     log('DEBUG', `[WS] 发送设备列表到Web客户端，设备数量: ${allDevices.length}`);
     ws.send(JSON.stringify({
         type: 'deviceList',
@@ -1197,15 +1245,7 @@ function broadcastDeviceListToWeb() {
             if (!_broadcastDirty) return;
             _broadcastDirty = false;
             
-            const allDevices = [];
-            consoleClients.forEach((consoleClient, consoleId) => {
-                consoleClient.devices.forEach((device, serial) => {
-                    allDevices.push({
-                        ...device,
-                        consoleId: consoleId
-                    });
-                });
-            });
+            const allDevices = buildWebDeviceList();
             
             const message = JSON.stringify({
                 type: 'deviceList',
