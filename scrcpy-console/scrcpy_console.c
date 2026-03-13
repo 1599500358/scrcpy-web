@@ -1265,9 +1265,9 @@ void handle_server_message(const char* message) {
                     }
 #endif
 
-                    // 直连 relay-server 模式：再观察 3 秒，避免“启动成功后马上退出”的假成功
+                    // 直连 relay-server 模式：再观察 10 秒，避免“启动成功后几秒退出”的假成功
                     if (!use_local_relay[i]) {
-                        DWORD stable_wait = WaitForSingleObject(pi.hProcess, 3000);
+                        DWORD stable_wait = WaitForSingleObject(pi.hProcess, 10000);
                         if (stable_wait == WAIT_OBJECT_0) {
                             GetExitCodeProcess(pi.hProcess, &last_exit_code);
                             print_log("WARNING", "第 %d 次直连模式短期退出 (exit=%lu): %s", i + 1, last_exit_code, start_cmds[i]);
