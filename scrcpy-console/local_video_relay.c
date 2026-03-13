@@ -119,7 +119,11 @@ static int recv_http_headers(SOCKET sock, char* request, int request_size) {
     while (total < request_size - 1) {
         int r = recv(sock, request + total, request_size - 1 - total, 0);
         if (r <= 0) {
-            return -1;
+            if (total > 0) {
+                request[total] = '\0';
+                return total;
+            }
+            return r;
         }
         total += r;
         request[total] = '\0';
@@ -127,7 +131,8 @@ static int recv_http_headers(SOCKET sock, char* request, int request_size) {
             return total;
         }
     }
-    return -1;
+    request[total] = '\0';
+    return total;
 }
 
 static bool extract_header_value(const char* request, const char* header_name,
@@ -216,6 +221,10 @@ static bool do_websocket_handshake(SOCKET sock, char* serial_out, int serial_siz
         } else {
             print_log("WARN", "[LocalRelay] 握手读取请求头失败: wsa=%d", err);
         }
+        return false;
+    }
+    if (!strstr(request, "\r\n\r\n")) {
+        print_log("WARN", "[LocalRelay] 握手请求不完整(%d字节): %.200s", received, request);
         return false;
     }
 

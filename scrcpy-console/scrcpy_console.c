@@ -383,7 +383,6 @@ bool connect_to_server() {
 
 bool send_websocket_message(const char* message) {
     int len = strlen(message);
-    print_log("DEBUG", "准备发送WebSocket消息，长度: %d 字节", len);
     
     // 检查消息是否太大
     if (len >= MAX_WS_PAYLOAD_SIZE) {
@@ -446,7 +445,6 @@ bool send_websocket_message(const char* message) {
     }
     frame_len += len;
     
-    print_log("DEBUG", "WebSocket帧构建完成，帧长度: %d 字节", frame_len);
     
     // 循环发送确保完整发出
     int total_sent = 0;
@@ -462,7 +460,6 @@ bool send_websocket_message(const char* message) {
     }
     
     if (result) {
-        print_log("DEBUG", "WebSocket消息发送成功");
     }
 
     free(frame);
@@ -1145,9 +1142,8 @@ void handle_server_message(const char* message) {
 
                 // 构建 scrcpy 命令 - 使用多级回退策略
                 // 1) baseline profile
-                // 2) 默认编码参数
-                // 3) 指定软件编码器 OMX.google.h264.encoder
-                // 4) 指定 C2 编码器 c2.android.avc.encoder
+                // 2) 默认编码参数 + 降分辨率
+                // 3) 指定软件编码器 OMX.google.h264.encoder + 降分辨率
                 // WebRTC 模式下，如果本地 target 失败，还会对 relay-server 再做一组回退尝试
                 char start_cmds[12][1024];
                 bool use_local_relay[12];
@@ -1158,29 +1154,21 @@ void handle_server_message(const char* message) {
                     serial, target_server);
                 use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
                 snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
-                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio",
+                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --max-size=1024",
                     serial, target_server);
                 use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
                 snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                     ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=OMX.google.h264.encoder --max-size=1024",
                     serial, target_server);
                 use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
-                snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
-                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=c2.android.avc.encoder --max-size=1024",
-                    serial, target_server);
-                use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
 #ifdef USE_WEBRTC
                 if (g_webrtc_enabled && strcmp(target_server, server_url) != 0) {
                     snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
-                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio",
+                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --max-size=1024",
                         serial, server_url);
                     use_local_relay[attempt_count - 1] = false;
                     snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                         ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=OMX.google.h264.encoder --max-size=1024",
-                        serial, server_url);
-                    use_local_relay[attempt_count - 1] = false;
-                    snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
-                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=c2.android.avc.encoder --max-size=1024",
                         serial, server_url);
                     use_local_relay[attempt_count - 1] = false;
                 }
@@ -1204,11 +1192,28 @@ void handle_server_message(const char* message) {
                 const char* final_cmd = NULL;
                 DWORD last_exit_code = 0;
                 DWORD last_launch_error = 0;
+                bool has_local_target = (strcmp(target_server, server_url) != 0);
+                bool refreshed_prepare_for_direct = false;
 
                 for (int i = 0; i < attempt_count; i++) {
                     ZeroMemory(&pi, sizeof(pi));
                     final_cmd = start_cmds[i];
                     LONG version_before_launch = g_video_connect_version;
+
+                    // 从本地 relay 回退到直连 relay-server 前，再次预注册，避免预注册令牌被消耗
+                    if (has_local_target && !use_local_relay[i] && !refreshed_prepare_for_direct) {
+                        char retry_prepare_msg[512];
+                        snprintf(retry_prepare_msg, sizeof(retry_prepare_msg),
+                            "{\"type\":\"prepareStream\",\"serial\":\"%s\",\"consoleId\":\"%s\"}",
+                            serial, client_id);
+                        if (send_websocket_message(retry_prepare_msg)) {
+                            print_log("INFO", "进入直连回退，重新预注册设备推流: %s", serial);
+                        } else {
+                            print_log("WARN", "进入直连回退时重新预注册发送失败: %s", serial);
+                        }
+                        Sleep(300);
+                        refreshed_prepare_for_direct = true;
+                    }
 
                     BOOL launch_ok = CreateProcessA(NULL, start_cmds[i], NULL, NULL, FALSE,
                                                     0, NULL, NULL, &si, &pi);
@@ -1236,7 +1241,7 @@ void handle_server_message(const char* message) {
                     // 本地 relay 模式必须看到实际视频连接，才算真正成功
                     if (g_webrtc_enabled && use_local_relay[i]) {
                         bool got_video_connection = false;
-                        for (int k = 0; k < 40; k++) { // 最多等待 4 秒
+                        for (int k = 0; k < 100; k++) { // 最多等待 10 秒
                             Sleep(100);
                             if (g_video_connect_version > version_before_launch &&
                                 strcmp(g_last_video_connected_serial, serial) == 0) {
@@ -1259,6 +1264,20 @@ void handle_server_message(const char* message) {
                         }
                     }
 #endif
+
+                    // 直连 relay-server 模式：再观察 3 秒，避免“启动成功后马上退出”的假成功
+                    if (!use_local_relay[i]) {
+                        DWORD stable_wait = WaitForSingleObject(pi.hProcess, 3000);
+                        if (stable_wait == WAIT_OBJECT_0) {
+                            GetExitCodeProcess(pi.hProcess, &last_exit_code);
+                            print_log("WARNING", "第 %d 次直连模式短期退出 (exit=%lu): %s", i + 1, last_exit_code, start_cmds[i]);
+                            CloseHandle(pi.hProcess);
+                            CloseHandle(pi.hThread);
+                            continue;
+                        } else if (stable_wait == WAIT_FAILED) {
+                            print_log("WARNING", "第 %d 次直连模式稳定性检测失败，按已启动处理", i + 1);
+                        }
+                    }
 
                     // 已成功启动并存活超过2秒（或无法检测但未确认退出）
                     devices[device_index].process_id = pi.dwProcessId;
@@ -2070,7 +2089,6 @@ void send_updated_device_list() {
         send_websocket_message(message);
         free(message);
         
-        print_log("INFO", "设备 %s 更新信息已发送到服务器", devices[i].serial);
     }
 }
 
