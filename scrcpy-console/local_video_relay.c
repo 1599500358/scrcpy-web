@@ -16,6 +16,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <process.h>
+#include <wincrypt.h>
 
 #define LOCAL_VIDEO_PORT 27183
 #define MAX_LOCAL_CLIENTS 8
@@ -41,6 +42,12 @@ extern char client_id[64];
 
 // 视频连接建立回调
 static VideoConnectCallback g_video_connect_callback = NULL;
+
+typedef enum {
+    WS_CONN_UNKNOWN = 0,
+    WS_CONN_VIDEO = 1,
+    WS_CONN_CONTROL = 2
+} WsConnType;
 
 // 设置视频连接建立回调
 void set_video_connect_callback(VideoConnectCallback callback) {
@@ -107,14 +114,105 @@ static int ws_send_unmasked(SOCKET sock, const uint8_t* data, size_t len) {
     return send(sock, (char*)data, (int)len, 0);
 }
 
-// WebSocket 握手
-static bool do_websocket_handshake(SOCKET sock, char* serial_out, int serial_size) {
-    char request[2048];
-    int received = recv(sock, request, sizeof(request) - 1, 0);
-    if (received <= 0) {
+static int recv_http_headers(SOCKET sock, char* request, int request_size) {
+    int total = 0;
+    while (total < request_size - 1) {
+        int r = recv(sock, request + total, request_size - 1 - total, 0);
+        if (r <= 0) {
+            return -1;
+        }
+        total += r;
+        request[total] = '\0';
+        if (strstr(request, "\r\n\r\n")) {
+            return total;
+        }
+    }
+    return -1;
+}
+
+static bool extract_header_value(const char* request, const char* header_name,
+                                 char* out, int out_size) {
+    const char* start = strstr(request, header_name);
+    if (!start) {
         return false;
     }
-    request[received] = '\0';
+    start += strlen(header_name);
+    while (*start == ' ' || *start == '\t') {
+        start++;
+    }
+    const char* end = strstr(start, "\r\n");
+    if (!end) {
+        return false;
+    }
+    int len = (int)(end - start);
+    while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t')) {
+        len--;
+    }
+    if (len <= 0 || len >= out_size) {
+        return false;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool build_websocket_accept(const char* ws_key, char* accept_out, int accept_size) {
+    static const char* ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char key_with_guid[256];
+    snprintf(key_with_guid, sizeof(key_with_guid), "%s%s", ws_key, ws_guid);
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    bool ok = false;
+    BYTE hash[20];
+    DWORD hash_len = sizeof(hash);
+
+    if (!CryptAcquireContextA(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        if (!CryptAcquireContextA(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            return false;
+        }
+    }
+    if (!CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+    if (!CryptHashData(hHash, (const BYTE*)key_with_guid, (DWORD)strlen(key_with_guid), 0)) {
+        goto cleanup;
+    }
+    if (!CryptGetHashParam(hHash, HP_HASHVAL, hash, &hash_len, 0)) {
+        goto cleanup;
+    }
+
+    DWORD b64_len = 0;
+    if (!CryptBinaryToStringA(hash, hash_len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64_len)) {
+        goto cleanup;
+    }
+    if ((int)b64_len > accept_size) {
+        goto cleanup;
+    }
+    if (!CryptBinaryToStringA(hash, hash_len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, accept_out, &b64_len)) {
+        goto cleanup;
+    }
+    ok = true;
+
+cleanup:
+    if (hHash) {
+        CryptDestroyHash(hHash);
+    }
+    if (hProv) {
+        CryptReleaseContext(hProv, 0);
+    }
+    return ok;
+}
+
+// WebSocket 握手
+static bool do_websocket_handshake(SOCKET sock, char* serial_out, int serial_size, WsConnType* conn_type_out) {
+    char request[4096];
+    int received = recv_http_headers(sock, request, sizeof(request));
+    if (received <= 0) {
+        print_log("WARN", "[LocalRelay] 握手读取请求头失败: wsa=%d", WSAGetLastError());
+        return false;
+    }
 
     // 解析 GET 请求路径获取 serial
     // GET /?type=scrcpy&serial=xxx HTTP/1.1
@@ -125,31 +223,57 @@ static bool do_websocket_handshake(SOCKET sock, char* serial_out, int serial_siz
         while (*serial_end && *serial_end != ' ' && *serial_end != '&' && *serial_end != '\r' && *serial_end != '\n') {
             serial_end++;
         }
-        int len = serial_end - serial_start;
-        if (len >= serial_size) len = serial_size - 1;
+        int len = (int)(serial_end - serial_start);
+        if (len >= serial_size) {
+            len = serial_size - 1;
+        }
         strncpy(serial_out, serial_start, len);
         serial_out[len] = '\0';
     } else {
+        print_log("WARN", "[LocalRelay] 握手请求缺少 serial 参数: %s", request);
         return false;
     }
 
-    // 检查是否是控制连接
-    bool is_control = strstr(request, "type=control") != NULL;
+    WsConnType conn_type = WS_CONN_UNKNOWN;
+    if (strstr(request, "type=control") != NULL) {
+        conn_type = WS_CONN_CONTROL;
+    } else if (strstr(request, "type=scrcpy") != NULL) {
+        conn_type = WS_CONN_VIDEO;
+    }
+    if (conn_type_out) {
+        *conn_type_out = conn_type;
+    }
 
-    // 发送握手响应
-    const char* response =
+    char ws_key[256];
+    if (!extract_header_value(request, "Sec-WebSocket-Key:", ws_key, sizeof(ws_key))) {
+        print_log("WARN", "[LocalRelay] 握手缺少 Sec-WebSocket-Key");
+        return false;
+    }
+
+    char accept_key[128];
+    if (!build_websocket_accept(ws_key, accept_key, sizeof(accept_key))) {
+        print_log("WARN", "[LocalRelay] 计算 Sec-WebSocket-Accept 失败");
+        return false;
+    }
+
+    char response[512];
+    snprintf(response, sizeof(response),
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
-        "\r\n";
+        "Sec-WebSocket-Accept: %s\r\n"
+        "\r\n",
+        accept_key);
 
-    if (send(sock, response, strlen(response), 0) <= 0) {
+    if (send(sock, response, (int)strlen(response), 0) <= 0) {
+        print_log("WARN", "[LocalRelay] 握手响应发送失败: wsa=%d", WSAGetLastError());
         return false;
     }
 
-    print_log("INFO", "[LocalRelay] WebSocket 握手成功，serial: %s, control: %s",
-              serial_out, is_control ? "yes" : "no");
+    print_log("INFO", "[LocalRelay] WebSocket 握手成功，serial: %s, type=%s",
+              serial_out,
+              conn_type == WS_CONN_CONTROL ? "control" :
+              (conn_type == WS_CONN_VIDEO ? "scrcpy" : "unknown"));
 
     return true;
 }
@@ -293,34 +417,47 @@ static unsigned __stdcall local_server_listener(void* param) {
 
             if (client_sock != INVALID_SOCKET) {
                 char serial[256] = {0};
-                if (do_websocket_handshake(client_sock, serial, sizeof(serial))) {
-                    // 检查是视频连接还是控制连接
-                    // 根据 URL 参数判断
-
+                WsConnType conn_type = WS_CONN_UNKNOWN;
+                if (do_websocket_handshake(client_sock, serial, sizeof(serial), &conn_type)) {
                     LocalScrcpyClient* client = find_local_client(serial);
                     if (!client) {
                         client = create_local_client(serial);
                     }
 
-                    if (client) {
-                        // 假设第一个连接是视频连接
-                        if (client->video_socket == INVALID_SOCKET) {
-                            client->video_socket = client_sock;
-                            print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
+                    if (!client) {
+                        print_log("WARN", "[LocalRelay] 客户端槽位不足，拒绝连接: %s", serial);
+                        closesocket(client_sock);
+                        continue;
+                    }
 
-                            // 调用回调通知主程序（触发 WebRTC Offer 创建）
-                            if (g_video_connect_callback) {
-                                g_video_connect_callback(serial);
-                            }
+                    if (conn_type == WS_CONN_UNKNOWN) {
+                        print_log("WARN", "[LocalRelay] 未知连接类型，拒绝: %s", serial);
+                        closesocket(client_sock);
+                        continue;
+                    }
 
-                            // 启动视频转发线程
-                            HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, video_relay_thread, client, 0, NULL);
-                            if (thread) {
-                                CloseHandle(thread);
-                            }
-                        } else {
-                            client->control_socket = client_sock;
-                            print_log("INFO", "[LocalRelay] 控制连接已建立: %s", serial);
+                    if (conn_type == WS_CONN_CONTROL) {
+                        if (client->control_socket != INVALID_SOCKET) {
+                            closesocket(client->control_socket);
+                        }
+                        client->control_socket = client_sock;
+                        print_log("INFO", "[LocalRelay] 控制连接已建立: %s", serial);
+                    } else {
+                        if (client->video_socket != INVALID_SOCKET) {
+                            closesocket(client->video_socket);
+                        }
+                        client->video_socket = client_sock;
+                        print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
+
+                        // 调用回调通知主程序（触发 WebRTC Offer 创建）
+                        if (g_video_connect_callback) {
+                            g_video_connect_callback(serial);
+                        }
+
+                        // 启动视频转发线程
+                        HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, video_relay_thread, client, 0, NULL);
+                        if (thread) {
+                            CloseHandle(thread);
                         }
                     }
                 } else {

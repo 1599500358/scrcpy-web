@@ -23,7 +23,7 @@ if %errorlevel% neq 0 (
 
 REM 设置编译选项
 set SOURCES=scrcpy_console.c
-set LIBS=ws2_32.lib ole32.lib oleaut32.lib windowscodecs.lib
+set LIBS=ws2_32.lib ole32.lib oleaut32.lib windowscodecs.lib advapi32.lib crypt32.lib
 
 if %ENABLE_WEBRTC%==1 (
     echo 启用 WebRTC 支持...
@@ -47,7 +47,7 @@ if %ENABLE_WEBRTC%==1 (
         exit /b 1
     )
 
-    set SOURCES=%SOURCES% webrtc_support.c
+    set SOURCES=%SOURCES% webrtc_support.c local_video_relay.c
     set LIBS=%LIBS% datachannel.lib
     set DEFINES=/D USE_WEBRTC
     set INCLUDES=/I libdatachannel\include

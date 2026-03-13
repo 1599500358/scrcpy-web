@@ -933,7 +933,7 @@ void handle_server_message(const char* message) {
         char* success_start = strstr(message, "\"success\":true");
         
         if (serial_start && success_start) {
-            serial_start += 11;
+            serial_start += 10;
             char* serial_end = strchr(serial_start, '"');
             if (serial_end) {
                 char serial[256];
@@ -1122,7 +1122,6 @@ void handle_server_message(const char* message) {
                 Sleep(500);
 
                 // 启动 scrcpy 推流
-                char scrcpy_cmd[1024];
                 char* target_server;
 
 #ifdef USE_WEBRTC
@@ -1139,20 +1138,31 @@ void handle_server_message(const char* message) {
                 target_server = server_url;
 #endif
 
-                // 构建 scrcpy 命令 - 使用 WebSocket 推流模式
-                // 使用当前目录的 scrcpy.exe（确保使用编译的新版本）
-                // --websocket-server: 连接到中继服务器
-                // --no-video-playback: 禁用本地窗口显示
-                // --no-audio: 禁用音频（简化）
-                // --video-codec-options profile:int=1: 强制使用 H.264 Baseline Profile
-                //   (1 = AVCProfileBaseline, 浏览器 WebCodecs 兼容性最好)
-                // 直接启动scrcpy.exe以获取正确的进程ID
-                snprintf(scrcpy_cmd, sizeof(scrcpy_cmd),
+                // 构建 scrcpy 命令 - 使用多级回退策略
+                // 1) 首选 target_server + baseline profile
+                // 2) target_server + 默认编码参数
+                // 3) (WebRTC模式) 回退为直连 relay-server + 默认编码参数
+                char start_cmds[4][1024];
+                int attempt_count = 0;
+
+                snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                     ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
                     serial, target_server);
+                snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio",
+                    serial, target_server);
+#ifdef USE_WEBRTC
+                if (g_webrtc_enabled && strcmp(target_server, server_url) != 0) {
+                    snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio",
+                        serial, server_url);
+                }
+#endif
 
-                print_log("INFO", "启动命令: %s", scrcpy_cmd);
-                print_log("INFO", "WebSocket 目标服务器: %s", target_server);
+                print_log("INFO", "WebSocket 首选目标: %s", target_server);
+                for (int i = 0; i < attempt_count; i++) {
+                    print_log("INFO", "启动命令(尝试 %d/%d): %s", i + 1, attempt_count, start_cmds[i]);
+                }
                 
                 // 使用 CreateProcess 启动，以便获取进程 ID
                 STARTUPINFOA si;
@@ -1162,18 +1172,51 @@ void handle_server_message(const char* message) {
                 // 隐藏窗口
                 si.dwFlags = STARTF_USESHOWWINDOW;
                 si.wShowWindow = SW_HIDE;  // 隐藏窗口
-                ZeroMemory(&pi, sizeof(pi));
-                
-                if (CreateProcessA(NULL, scrcpy_cmd, NULL, NULL, FALSE, 
-                                  0, NULL, NULL, &si, &pi)) {
-                    // 记录进程 ID
+
+                bool started = false;
+                const char* final_cmd = NULL;
+                DWORD last_exit_code = 0;
+                DWORD last_launch_error = 0;
+
+                for (int i = 0; i < attempt_count; i++) {
+                    ZeroMemory(&pi, sizeof(pi));
+                    final_cmd = start_cmds[i];
+
+                    BOOL launch_ok = CreateProcessA(NULL, start_cmds[i], NULL, NULL, FALSE,
+                                                    0, NULL, NULL, &si, &pi);
+                    if (!launch_ok) {
+                        last_launch_error = GetLastError();
+                        print_log("WARNING", "第 %d 次启动失败，错误码: %lu", i + 1, last_launch_error);
+                        continue;
+                    }
+
+                    // 2秒内退出视为本次尝试失败（常见于编码参数或WS目标不兼容）
+                    DWORD wait_result = WaitForSingleObject(pi.hProcess, 2000);
+                    if (wait_result == WAIT_OBJECT_0) {
+                        GetExitCodeProcess(pi.hProcess, &last_exit_code);
+                        print_log("WARNING", "第 %d 次启动后快速退出 (exit=%lu): %s", i + 1, last_exit_code, start_cmds[i]);
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        continue;
+                    }
+
+                    if (wait_result == WAIT_FAILED) {
+                        print_log("WARNING", "第 %d 次启动后状态检测失败，按已启动处理", i + 1);
+                    }
+
+                    // 已成功启动并存活超过2秒（或无法检测但未确认退出）
                     devices[device_index].process_id = pi.dwProcessId;
                     devices[device_index].streaming = true;
-                    
+                    started = true;
+
                     CloseHandle(pi.hProcess);
                     CloseHandle(pi.hThread);
-                    
-                    print_log("SUCCESS", "已启动设备 %s 的镜像，进程 ID: %lu", serial, pi.dwProcessId);
+                    break;
+                }
+
+                if (started) {
+                    print_log("SUCCESS", "已启动设备 %s 的镜像，进程 ID: %lu", serial, devices[device_index].process_id);
+                    print_log("INFO", "最终使用命令: %s", final_cmd ? final_cmd : "(unknown)");
 
                     // 通知服务器已开始推流
                     char notify_msg[512];
@@ -1181,14 +1224,17 @@ void handle_server_message(const char* message) {
                         "{\"type\":\"startStreaming\",\"serial\":\"%s\"}",
                         serial);
                     send_websocket_message(notify_msg);
-
-                    // WebRTC Offer 将在 scrcpy 连接到本地服务器后由回调触发创建
                 } else {
-                    DWORD last_error = GetLastError();
-                    print_log("ERROR", "启动设备 %s 失败，错误代码: %lu", serial, last_error);
-                    char fail_reason[256];
-                    snprintf(fail_reason, sizeof(fail_reason), "启动 scrcpy 失败，错误码: %lu", last_error);
-                    report_start_device_failed(serial, "scrcpy_launch_failed", fail_reason);
+                    if (last_exit_code != 0) {
+                        char fail_reason[384];
+                        snprintf(fail_reason, sizeof(fail_reason),
+                            "scrcpy 启动即退出（exit=%lu），请检查本地WS目标与设备兼容性", last_exit_code);
+                        report_start_device_failed(serial, "scrcpy_exit_early", fail_reason);
+                    } else {
+                        char fail_reason[256];
+                        snprintf(fail_reason, sizeof(fail_reason), "启动 scrcpy 失败，错误码: %lu", last_launch_error);
+                        report_start_device_failed(serial, "scrcpy_launch_failed", fail_reason);
+                    }
                 }
             } else {
                 print_log("ERROR", "无法解析设备序列号");
