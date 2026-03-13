@@ -39,6 +39,8 @@ extern const GUID GUID_WICPixelFormat24bppBGR;
 #define WEBRTC_STUN_SERVER "stun.l.google.com:19302"
 static bool g_webrtc_enabled = false;
 static WebRTCConfig g_webrtc_config = {0};
+static volatile LONG g_video_connect_version = 0;
+static char g_last_video_connected_serial[256] = {0};
 #endif
 
 // 线程参数结构
@@ -503,6 +505,9 @@ void on_video_connected(const char* serial) {
     if (!serial) return;
 
     print_log("INFO", "[WebRTC] 视频连接已建立，创建 WebRTC Offer: %s", serial);
+    strncpy(g_last_video_connected_serial, serial, sizeof(g_last_video_connected_serial) - 1);
+    g_last_video_connected_serial[sizeof(g_last_video_connected_serial) - 1] = '\0';
+    InterlockedIncrement(&g_video_connect_version);
 
     // 构建完整的 deviceId (consoleId:serial)
     char full_device_id[512];
@@ -1139,23 +1144,45 @@ void handle_server_message(const char* message) {
 #endif
 
                 // 构建 scrcpy 命令 - 使用多级回退策略
-                // 1) 首选 target_server + baseline profile
-                // 2) target_server + 默认编码参数
-                // 3) (WebRTC模式) 回退为直连 relay-server + 默认编码参数
-                char start_cmds[4][1024];
+                // 1) baseline profile
+                // 2) 默认编码参数
+                // 3) 指定软件编码器 OMX.google.h264.encoder
+                // 4) 指定 C2 编码器 c2.android.avc.encoder
+                // WebRTC 模式下，如果本地 target 失败，还会对 relay-server 再做一组回退尝试
+                char start_cmds[12][1024];
+                bool use_local_relay[12];
                 int attempt_count = 0;
 
                 snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                     ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
                     serial, target_server);
+                use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
                 snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                     ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio",
                     serial, target_server);
+                use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
+                snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=OMX.google.h264.encoder --max-size=1024",
+                    serial, target_server);
+                use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
+                snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=c2.android.avc.encoder --max-size=1024",
+                    serial, target_server);
+                use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
 #ifdef USE_WEBRTC
                 if (g_webrtc_enabled && strcmp(target_server, server_url) != 0) {
                     snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                         ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio",
                         serial, server_url);
+                    use_local_relay[attempt_count - 1] = false;
+                    snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=OMX.google.h264.encoder --max-size=1024",
+                        serial, server_url);
+                    use_local_relay[attempt_count - 1] = false;
+                    snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-encoder=c2.android.avc.encoder --max-size=1024",
+                        serial, server_url);
+                    use_local_relay[attempt_count - 1] = false;
                 }
 #endif
 
@@ -1181,6 +1208,7 @@ void handle_server_message(const char* message) {
                 for (int i = 0; i < attempt_count; i++) {
                     ZeroMemory(&pi, sizeof(pi));
                     final_cmd = start_cmds[i];
+                    LONG version_before_launch = g_video_connect_version;
 
                     BOOL launch_ok = CreateProcessA(NULL, start_cmds[i], NULL, NULL, FALSE,
                                                     0, NULL, NULL, &si, &pi);
@@ -1203,6 +1231,34 @@ void handle_server_message(const char* message) {
                     if (wait_result == WAIT_FAILED) {
                         print_log("WARNING", "第 %d 次启动后状态检测失败，按已启动处理", i + 1);
                     }
+
+#ifdef USE_WEBRTC
+                    // 本地 relay 模式必须看到实际视频连接，才算真正成功
+                    if (g_webrtc_enabled && use_local_relay[i]) {
+                        bool got_video_connection = false;
+                        for (int k = 0; k < 40; k++) { // 最多等待 4 秒
+                            Sleep(100);
+                            if (g_video_connect_version > version_before_launch &&
+                                strcmp(g_last_video_connected_serial, serial) == 0) {
+                                got_video_connection = true;
+                                break;
+                            }
+                            DWORD state = WaitForSingleObject(pi.hProcess, 0);
+                            if (state == WAIT_OBJECT_0) {
+                                break;
+                            }
+                        }
+                        if (!got_video_connection) {
+                            DWORD exit_code = STILL_ACTIVE;
+                            GetExitCodeProcess(pi.hProcess, &exit_code);
+                            print_log("WARNING", "第 %d 次未建立本地视频连接，终止本次尝试 (exit=%lu)", i + 1, exit_code);
+                            TerminateProcess(pi.hProcess, 0);
+                            CloseHandle(pi.hProcess);
+                            CloseHandle(pi.hThread);
+                            continue;
+                        }
+                    }
+#endif
 
                     // 已成功启动并存活超过2秒（或无法检测但未确认退出）
                     devices[device_index].process_id = pi.dwProcessId;
@@ -1228,7 +1284,7 @@ void handle_server_message(const char* message) {
                     if (last_exit_code != 0) {
                         char fail_reason[384];
                         snprintf(fail_reason, sizeof(fail_reason),
-                            "scrcpy 启动即退出（exit=%lu），请检查本地WS目标与设备兼容性", last_exit_code);
+                            "scrcpy 启动即退出（exit=%lu），疑似设备编码器不兼容（MediaCodec configure失败）", last_exit_code);
                         report_start_device_failed(serial, "scrcpy_exit_early", fail_reason);
                     } else {
                         char fail_reason[256];

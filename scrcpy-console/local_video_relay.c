@@ -210,7 +210,12 @@ static bool do_websocket_handshake(SOCKET sock, char* serial_out, int serial_siz
     char request[4096];
     int received = recv_http_headers(sock, request, sizeof(request));
     if (received <= 0) {
-        print_log("WARN", "[LocalRelay] 握手读取请求头失败: wsa=%d", WSAGetLastError());
+        int err = WSAGetLastError();
+        if (err == 0) {
+            print_log("INFO", "[LocalRelay] 连接在发送握手前已关闭");
+        } else {
+            print_log("WARN", "[LocalRelay] 握手读取请求头失败: wsa=%d", err);
+        }
         return false;
     }
 
