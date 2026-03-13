@@ -116,6 +116,7 @@ bool is_valid_serial(const char* serial);
 void free_device_thumbnails();
 void send_updated_device_list();
 void report_start_device_failed(const char* serial, const char* reason, const char* message);
+bool rotate_device_via_adb(const char* serial);
 
 // JSON 简单构建（实际项目建议使用 cJSON 库）
 void json_escape_string(const char* input, char* output, int output_size) {
@@ -542,6 +543,21 @@ static bool extract_serial_from_device_id(const char* device_id, char* serial_ou
     return true;
 }
 
+static bool is_control_action_message(const uint8_t* data, size_t len, const char* action) {
+    if (!data || len == 0 || !action) {
+        return false;
+    }
+
+    size_t copy_len = len < 1023 ? len : 1023;
+    char payload[1024];
+    memcpy(payload, data, copy_len);
+    payload[copy_len] = '\0';
+
+    char action_pattern[96];
+    snprintf(action_pattern, sizeof(action_pattern), "\"action\":\"%s\"", action);
+    return strstr(payload, "\"type\":\"control\"") && strstr(payload, action_pattern);
+}
+
 void on_webrtc_data_message(const char* device_id, const uint8_t* data, size_t len) {
     if (!device_id || !data || len == 0) {
         return;
@@ -550,6 +566,15 @@ void on_webrtc_data_message(const char* device_id, const uint8_t* data, size_t l
     char serial[256];
     if (!extract_serial_from_device_id(device_id, serial, sizeof(serial))) {
         print_log("WARN", "[WebRTC] 无法从 device_id 解析 serial: %s", device_id ? device_id : "(null)");
+        return;
+    }
+
+    if (is_control_action_message(data, len, "rotate")) {
+        if (rotate_device_via_adb(serial)) {
+            print_log("INFO", "[WebRTC] 旋转指令已执行: %s", serial);
+        } else {
+            print_log("WARN", "[WebRTC] 旋转指令执行失败: %s", serial);
+        }
         return;
     }
 
@@ -566,6 +591,58 @@ void on_webrtc_data_message(const char* device_id, const uint8_t* data, size_t l
     } else {
         print_log("WARN", "[WebRTC] P2P 控制消息转发失败: %s", serial);
     }
+}
+
+static bool probe_local_relay_port(int port) {
+    SOCKET probe_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (probe_sock == INVALID_SOCKET) {
+        return false;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons((u_short)port);
+
+    int rc = connect(probe_sock, (struct sockaddr*)&addr, sizeof(addr));
+    closesocket(probe_sock);
+    return rc == 0;
+}
+
+static bool ensure_local_relay_ready(const char* serial) {
+    int relay_port = get_local_video_port();
+    bool healthy = is_local_video_relay_healthy();
+    bool port_open = probe_local_relay_port(relay_port);
+    if (healthy && port_open) {
+        return true;
+    }
+
+    print_log("WARNING", "[LocalRelay] 检测到本地转发服务异常，尝试恢复 (port=%d, healthy=%d, port_open=%d)",
+              relay_port, healthy ? 1 : 0, port_open ? 1 : 0);
+
+    stop_local_video_relay();
+    Sleep(80);
+
+    if (!init_local_video_relay()) {
+        print_log("ERROR", "[LocalRelay] 自动恢复失败，端口: %d", relay_port);
+        report_start_device_failed(serial, "local_relay_unavailable", "本地转发服务不可用，请重启控制台程序");
+        return false;
+    }
+
+    Sleep(120);
+    relay_port = get_local_video_port();
+    healthy = is_local_video_relay_healthy();
+    port_open = probe_local_relay_port(relay_port);
+    if (!healthy || !port_open) {
+        print_log("ERROR", "[LocalRelay] 恢复后仍异常，端口: %d (healthy=%d, port_open=%d)",
+                  relay_port, healthy ? 1 : 0, port_open ? 1 : 0);
+        report_start_device_failed(serial, "local_relay_unhealthy", "本地转发服务异常，请重试或重启控制台程序");
+        return false;
+    }
+
+    print_log("SUCCESS", "[LocalRelay] 本地转发服务已恢复: 127.0.0.1:%d", relay_port);
+    return true;
 }
 #endif
 
@@ -656,6 +733,43 @@ int execute_adb_command(const char* command, char* output, int output_size) {
     
     int exit_code = _pclose(pipe);
     return exit_code;
+}
+
+bool rotate_device_via_adb(const char* serial) {
+    if (!is_valid_serial(serial)) {
+        print_log("ERROR", "旋转失败，设备序列号非法: %s", serial ? serial : "(null)");
+        return false;
+    }
+
+    char output[BUFFER_SIZE] = {0};
+    char cmd[512];
+
+    // 查询当前方向，默认按 0 处理
+    snprintf(cmd, sizeof(cmd), "-s %s shell settings get system user_rotation", serial);
+    int get_result = execute_adb_command(cmd, output, sizeof(output));
+    int current_rotation = 0;
+    if (get_result == 0) {
+        current_rotation = atoi(output);
+        if (current_rotation < 0 || current_rotation > 3) {
+            current_rotation = 0;
+        }
+    }
+
+    int next_rotation = (current_rotation + 1) % 4;
+
+    // 锁定自动旋转，确保方向切换立即生效
+    snprintf(cmd, sizeof(cmd), "-s %s shell settings put system accelerometer_rotation 0", serial);
+    execute_adb_command(cmd, output, sizeof(output));
+
+    snprintf(cmd, sizeof(cmd), "-s %s shell settings put system user_rotation %d", serial, next_rotation);
+    int set_result = execute_adb_command(cmd, output, sizeof(output));
+    if (set_result == 0) {
+        print_log("SUCCESS", "设备 %s 旋转成功: %d -> %d", serial, current_rotation, next_rotation);
+        return true;
+    }
+
+    print_log("ERROR", "设备 %s 旋转失败 (exit=%d)", serial, set_result);
+    return false;
 }
 
 int scan_adb_devices() {
@@ -1049,6 +1163,13 @@ void handle_server_message(const char* message) {
 #endif
                     }
                 } else {
+                    if (strcmp(action, "rotate") == 0) {
+                        if (!rotate_device_via_adb(serial)) {
+                            print_log("ERROR", "旋转指令执行失败: %s", serial);
+                        }
+                        return;
+                    }
+
                     // 优先走 scrcpy 控制通道（低延迟）
 #ifdef USE_WEBRTC
                     if (send_control_to_scrcpy(serial, (const uint8_t*)message, strlen(message))) {
@@ -1199,6 +1320,10 @@ void handle_server_message(const char* message) {
 #ifdef USE_WEBRTC
                 // WebRTC 模式：scrcpy 连接本地服务器，控制台通过 WebRTC 转发
                 if (g_webrtc_enabled) {
+                    if (!ensure_local_relay_ready(serial)) {
+                        InterlockedExchange(&g_start_device_in_progress, 0);
+                        return;
+                    }
                     static char local_server_addr[64];
                     snprintf(local_server_addr, sizeof(local_server_addr), "127.0.0.1:%d", get_local_video_port());
                     target_server = local_server_addr;
@@ -1272,6 +1397,15 @@ void handle_server_message(const char* message) {
                     ZeroMemory(&pi, sizeof(pi));
                     final_cmd = start_cmds[i];
                     LONG version_before_launch = g_video_connect_version;
+
+#ifdef USE_WEBRTC
+                    if (g_webrtc_enabled && use_local_relay[i]) {
+                        if (!ensure_local_relay_ready(serial)) {
+                            InterlockedExchange(&g_start_device_in_progress, 0);
+                            return;
+                        }
+                    }
+#endif
 
                     // 从本地 relay 回退到直连 relay-server 前，再次预注册，避免预注册令牌被消耗
                     if (has_local_target && !use_local_relay[i] && !refreshed_prepare_for_direct) {

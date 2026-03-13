@@ -865,6 +865,11 @@ function createDeviceListItem(device) {
     const li = document.createElement('li');
     li.className = 'device-item';
     li.dataset.deviceId = `${device.consoleId}:${device.serial}`;
+    const displayName = (
+        (typeof device.customName === 'string' && device.customName.trim()) ||
+        (typeof device.model === 'string' && device.model.trim()) ||
+        device.serial
+    );
     
     const thumbnailContainer = document.createElement('div');
     thumbnailContainer.className = 'device-thumbnail';
@@ -880,19 +885,16 @@ function createDeviceListItem(device) {
         placeholder.style.cssText = 'color: #666; font-size: 12px;';
         thumbnailContainer.appendChild(placeholder);
     }
-    thumbnail.alt = device.customName || device.model;
+    thumbnail.alt = displayName;
     thumbnailContainer.appendChild(thumbnail);
     
     const details = document.createElement('div');
     details.className = 'device-details';
-    
-    const nameRow = document.createElement('div');
-    nameRow.className = 'device-name-row';
-    
+
     const name = document.createElement('div');
     name.className = 'device-name';
-    name.textContent = device.customName || device.model;
-    name.title = device.customName || device.model;
+    name.textContent = displayName;
+    name.title = displayName;
 
     const actionWrap = document.createElement('div');
     actionWrap.className = 'device-actions';
@@ -915,16 +917,10 @@ function createDeviceListItem(device) {
 
     actionWrap.appendChild(editBtn);
     actionWrap.appendChild(groupBtn);
-    
-    nameRow.appendChild(name);
-    nameRow.appendChild(actionWrap);
-    
-    const info = document.createElement('div');
-    info.className = 'device-info';
-    info.textContent = `Serial: ${device.serial.substring(0, 12)}...`;
-    
-    details.appendChild(nameRow);
-    details.appendChild(info);
+
+    // 第一行只显示设备名，第二行显示操作按钮
+    details.appendChild(name);
+    details.appendChild(actionWrap);
     
     li.onclick = (evt) => selectDevice(`${device.consoleId}:${device.serial}`, evt);
     

@@ -24,6 +24,9 @@ void stop_local_video_relay(void);
 // 获取本地服务器端口
 int get_local_video_port(void);
 
+// 检查本地服务器健康状态（监听 socket 是否有效）
+bool is_local_video_relay_healthy(void);
+
 // 关闭指定设备的本地连接
 void close_local_client(const char* serial);
 

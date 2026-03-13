@@ -20,7 +20,8 @@
 #include <wincrypt.h>
 
 // Avoid collision with scrcpy default adb tunnel local port range (27183-27199)
-#define LOCAL_VIDEO_PORT 37183
+#define LOCAL_VIDEO_PORT_BASE 37183
+#define LOCAL_VIDEO_PORT_TRY_COUNT 32
 #define MAX_LOCAL_CLIENTS 8
 #define VIDEO_BUFFER_SIZE (1024 * 1024)  // 1MB
 
@@ -44,6 +45,7 @@ static int local_client_count = 0;
 static SOCKET local_server_socket = INVALID_SOCKET;
 static bool local_server_running = false;
 static HANDLE local_server_thread = NULL;
+static int local_server_port = 0;
 
 // 外部变量
 extern void print_log(const char* level, const char* format, ...);
@@ -554,7 +556,7 @@ static unsigned __stdcall video_relay_thread(void* param) {
 static unsigned __stdcall local_server_listener(void* param) {
     (void)param;
 
-    print_log("INFO", "[LocalRelay] 本地服务器监听端口 %d", LOCAL_VIDEO_PORT);
+    print_log("INFO", "[LocalRelay] 本地服务器监听端口 %d", local_server_port);
 
     while (local_server_running) {
         fd_set read_fds;
@@ -572,6 +574,11 @@ static unsigned __stdcall local_server_listener(void* param) {
             SOCKET client_sock = accept(local_server_socket, (struct sockaddr*)&client_addr, &addr_len);
 
             if (client_sock != INVALID_SOCKET) {
+                // 握手阶段设置短超时，避免异常连接长期阻塞监听线程
+                int handshake_timeout_ms = 1500;
+                setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&handshake_timeout_ms, sizeof(handshake_timeout_ms));
+                setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&handshake_timeout_ms, sizeof(handshake_timeout_ms));
+
                 char serial[256] = {0};
                 WsConnType conn_type = WS_CONN_UNKNOWN;
                 if (do_websocket_handshake(client_sock, serial, sizeof(serial), &conn_type)) {
@@ -629,32 +636,63 @@ static unsigned __stdcall local_server_listener(void* param) {
 // 初始化本地服务器
 bool init_local_video_relay() {
     // Winsock 已在主程序初始化，无需重复调用 WSAStartup
+    local_server_port = 0;
+    local_server_socket = INVALID_SOCKET;
 
-    local_server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (local_server_socket == INVALID_SOCKET) {
-        print_log("ERROR", "[LocalRelay] 无法创建 socket");
-        return false;
+    bool bound = false;
+    int last_wsa_error = 0;
+
+    for (int i = 0; i < LOCAL_VIDEO_PORT_TRY_COUNT; ++i) {
+        int candidate_port = LOCAL_VIDEO_PORT_BASE + i;
+        SOCKET candidate_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (candidate_socket == INVALID_SOCKET) {
+            last_wsa_error = WSAGetLastError();
+            print_log("ERROR", "[LocalRelay] 无法创建 socket: %d", last_wsa_error);
+            return false;
+        }
+
+        // Windows 下启用独占绑定，避免多个进程同时监听同一端口
+        BOOL exclusive = 1;
+        if (setsockopt(candidate_socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       (const char*)&exclusive, sizeof(exclusive)) == SOCKET_ERROR) {
+            print_log("WARN", "[LocalRelay] SO_EXCLUSIVEADDRUSE 设置失败: %d", WSAGetLastError());
+        }
+
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        server_addr.sin_port = htons((u_short)candidate_port);
+
+        if (bind(candidate_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+            last_wsa_error = WSAGetLastError();
+            closesocket(candidate_socket);
+
+            if (last_wsa_error == WSAEADDRINUSE || last_wsa_error == WSAEACCES) {
+                continue;
+            }
+            print_log("ERROR", "[LocalRelay] bind 失败 (port=%d): %d", candidate_port, last_wsa_error);
+            return false;
+        }
+
+        if (listen(candidate_socket, 5) == SOCKET_ERROR) {
+            last_wsa_error = WSAGetLastError();
+            print_log("ERROR", "[LocalRelay] listen 失败 (port=%d): %d", candidate_port, last_wsa_error);
+            closesocket(candidate_socket);
+            return false;
+        }
+
+        local_server_socket = candidate_socket;
+        local_server_port = candidate_port;
+        bound = true;
+        break;
     }
 
-    // 允许地址重用
-    int reuse = 1;
-    setsockopt(local_server_socket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
-
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    server_addr.sin_port = htons(LOCAL_VIDEO_PORT);
-
-    if (bind(local_server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-        print_log("ERROR", "[LocalRelay] bind 失败: %d", WSAGetLastError());
-        closesocket(local_server_socket);
-        return false;
-    }
-
-    if (listen(local_server_socket, 5) == SOCKET_ERROR) {
-        print_log("ERROR", "[LocalRelay] listen 失败");
-        closesocket(local_server_socket);
+    if (!bound) {
+        print_log("ERROR", "[LocalRelay] 无法绑定可用端口，尝试范围: %d-%d, last_wsa=%d",
+                  LOCAL_VIDEO_PORT_BASE,
+                  LOCAL_VIDEO_PORT_BASE + LOCAL_VIDEO_PORT_TRY_COUNT - 1,
+                  last_wsa_error);
         return false;
     }
 
@@ -665,10 +703,17 @@ bool init_local_video_relay() {
     if (!local_server_thread) {
         print_log("ERROR", "[LocalRelay] 无法创建监听线程");
         closesocket(local_server_socket);
+        local_server_socket = INVALID_SOCKET;
+        local_server_port = 0;
+        local_server_running = false;
         return false;
     }
 
-    print_log("SUCCESS", "[LocalRelay] 本地视频服务器已启动在端口 %d", LOCAL_VIDEO_PORT);
+    if (local_server_port != LOCAL_VIDEO_PORT_BASE) {
+        print_log("WARNING", "[LocalRelay] 首选端口 %d 被占用，已回退到端口 %d",
+                  LOCAL_VIDEO_PORT_BASE, local_server_port);
+    }
+    print_log("SUCCESS", "[LocalRelay] 本地视频服务器已启动在端口 %d", local_server_port);
     return true;
 }
 
@@ -691,6 +736,7 @@ void stop_local_video_relay() {
         closesocket(local_server_socket);
         local_server_socket = INVALID_SOCKET;
     }
+    local_server_port = 0;
 
     if (local_server_thread) {
         WaitForSingleObject(local_server_thread, 1000);
@@ -704,7 +750,35 @@ void stop_local_video_relay() {
 
 // 获取本地服务器端口
 int get_local_video_port() {
-    return LOCAL_VIDEO_PORT;
+    if (local_server_port > 0) {
+        return local_server_port;
+    }
+    return LOCAL_VIDEO_PORT_BASE;
+}
+
+bool is_local_video_relay_healthy() {
+    if (!local_server_running || local_server_socket == INVALID_SOCKET) {
+        return false;
+    }
+
+    // 监听线程必须存活；否则即使端口仍被内核保持，也无法处理握手
+    if (!local_server_thread) {
+        return false;
+    }
+    DWORD thread_wait = WaitForSingleObject(local_server_thread, 0);
+    if (thread_wait == WAIT_OBJECT_0) {
+        return false;
+    }
+    if (thread_wait == WAIT_FAILED) {
+        return false;
+    }
+
+    int so_error = 0;
+    int opt_len = sizeof(so_error);
+    if (getsockopt(local_server_socket, SOL_SOCKET, SO_ERROR, (char*)&so_error, &opt_len) == SOCKET_ERROR) {
+        return false;
+    }
+    return so_error == 0;
 }
 
 // 关闭指定设备的本地连接
@@ -738,6 +812,7 @@ bool send_control_to_scrcpy(const char* serial, const uint8_t* data, size_t len)
 bool init_local_video_relay() { return true; }
 void stop_local_video_relay() {}
 int get_local_video_port() { return 0; }
+bool is_local_video_relay_healthy() { return false; }
 void close_local_client(const char* serial) { (void)serial; }
 bool send_control_to_scrcpy(const char* serial, const uint8_t* data, size_t len) {
     (void)serial; (void)data; (void)len;
