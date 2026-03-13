@@ -111,6 +111,7 @@ const char* resolve_adb_path();
 bool is_valid_serial(const char* serial);
 void free_device_thumbnails();
 void send_updated_device_list();
+void report_start_device_failed(const char* serial, const char* reason, const char* message);
 
 // JSON 简单构建（实际项目建议使用 cJSON 库）
 void json_escape_string(const char* input, char* output, int output_size) {
@@ -466,6 +467,28 @@ bool send_websocket_message(const char* message) {
     return result;
 }
 
+void report_start_device_failed(const char* serial, const char* reason, const char* message) {
+    if (!serial || !reason || !message) {
+        return;
+    }
+
+    char escaped_serial[256];
+    char escaped_reason[128];
+    char escaped_message[512];
+    json_escape_string(serial, escaped_serial, sizeof(escaped_serial));
+    json_escape_string(reason, escaped_reason, sizeof(escaped_reason));
+    json_escape_string(message, escaped_message, sizeof(escaped_message));
+
+    char fail_msg[1024];
+    snprintf(fail_msg, sizeof(fail_msg),
+        "{\"type\":\"startDeviceFailed\",\"serial\":\"%s\",\"reason\":\"%s\",\"message\":\"%s\"}",
+        escaped_serial, escaped_reason, escaped_message);
+
+    if (!send_websocket_message(fail_msg)) {
+        print_log("ERROR", "上报启动失败消息发送失败: %s", serial);
+    }
+}
+
 #ifdef USE_WEBRTC
 // WebRTC 信令消息回调函数
 void webrtc_send_signaling_message(const char* device_id, const char* message) {
@@ -715,6 +738,56 @@ void send_device_list() {
         if (devices[i].custom_name[0] == '\0') {
             strncpy(devices[i].custom_name, devices[i].model, sizeof(devices[i].custom_name) - 1);
         }
+    }
+
+    // 先发送完整设备列表快照，确保服务端可清理已下线设备
+    size_t list_capacity = BUFFER_SIZE * 12;
+    char* list_message = (char*)malloc(list_capacity);
+    if (list_message) {
+        size_t offset = 0;
+        int written = snprintf(list_message + offset, list_capacity - offset,
+            "{\"type\":\"deviceList\",\"devices\":[");
+        if (written > 0 && (size_t)written < list_capacity - offset) {
+            offset += (size_t)written;
+
+            for (int i = 0; i < total_devices; i++) {
+                char escaped_serial[256], escaped_model[128], escaped_name[256];
+                json_escape_string(devices[i].serial, escaped_serial, sizeof(escaped_serial));
+                json_escape_string(devices[i].model, escaped_model, sizeof(escaped_model));
+                json_escape_string(devices[i].custom_name, escaped_name, sizeof(escaped_name));
+
+                written = snprintf(list_message + offset, list_capacity - offset,
+                    "{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\"}%s",
+                    escaped_serial,
+                    devices[i].state,
+                    escaped_model,
+                    escaped_name,
+                    (i < total_devices - 1) ? "," : "");
+                if (written <= 0 || (size_t)written >= list_capacity - offset) {
+                    offset = 0;
+                    break;
+                }
+                offset += (size_t)written;
+            }
+        } else {
+            offset = 0;
+        }
+
+        if (offset > 0) {
+            written = snprintf(list_message + offset, list_capacity - offset, "]}");
+            if (written > 0 && (size_t)written < list_capacity - offset) {
+                send_websocket_message(list_message);
+                print_log("INFO", "已发送完整设备列表快照: %d 个设备", total_devices);
+            } else {
+                print_log("WARNING", "设备列表快照构建失败（尾部写入失败）");
+            }
+        } else {
+            print_log("WARNING", "设备列表快照构建失败（缓冲区不足）");
+        }
+
+        free(list_message);
+    } else {
+        print_log("WARNING", "设备列表快照内存分配失败");
     }
     
     // 触发异步缩略图更新，而不是同步获取
@@ -971,16 +1044,78 @@ void handle_server_message(const char* message) {
                 // 验证 serial 安全性
                 if (!is_valid_serial(serial)) {
                     print_log("ERROR", "无效的设备序列号: %s，拒绝启动", serial);
+                    report_start_device_failed(serial, "invalid_serial", "设备序列号非法，已拒绝启动");
                     return;
+                }
+
+                // 校验设备是否存在于当前扫描列表中（必要时先重扫一次）
+                int device_index = -1;
+                for (int i = 0; i < device_count; i++) {
+                    if (strcmp(devices[i].serial, serial) == 0) {
+                        device_index = i;
+                        break;
+                    }
+                }
+                if (device_index < 0) {
+                    int refreshed_count = scan_adb_devices();
+                    if (refreshed_count > 0) {
+                        for (int i = 0; i < device_count; i++) {
+                            if (strcmp(devices[i].serial, serial) == 0) {
+                                device_index = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (device_index < 0) {
+                    print_log("ERROR", "设备不在当前ADB列表中: %s", serial);
+                    report_start_device_failed(serial, "device_not_found", "设备不存在或已离线，请刷新后重试");
+                    return;
+                }
+
+                if (strcmp(devices[device_index].state, "device") != 0) {
+                    print_log("ERROR", "设备状态不可用: %s (state=%s)", serial, devices[device_index].state);
+                    char fail_reason[256];
+                    snprintf(fail_reason, sizeof(fail_reason), "设备状态为 %s，无法启动镜像", devices[device_index].state);
+                    report_start_device_failed(serial, "device_not_ready", fail_reason);
+                    return;
+                }
+
+                // 已在推流则避免重复拉起（重复启动会导致 scrcpy 报错）
+                bool process_running = false;
+                if (devices[device_index].streaming && devices[device_index].process_id != 0) {
+                    HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, devices[device_index].process_id);
+                    if (hProcess) {
+                        DWORD wait_result = WaitForSingleObject(hProcess, 0);
+                        process_running = (wait_result == WAIT_TIMEOUT);
+                        CloseHandle(hProcess);
+                    }
+                }
+                if (process_running) {
+                    print_log("INFO", "设备 %s 已在推流中，跳过重复启动", serial);
+                    char notify_msg[512];
+                    snprintf(notify_msg, sizeof(notify_msg),
+                        "{\"type\":\"startStreaming\",\"serial\":\"%s\"}",
+                        serial);
+                    send_websocket_message(notify_msg);
+                    return;
+                }
+                if (devices[device_index].streaming) {
+                    devices[device_index].streaming = false;
+                    devices[device_index].process_id = 0;
                 }
                 
                 // 预注册设备推流
                 char prepare_msg[512];
-                sprintf(prepare_msg, "{\"type\":\"prepareStream\",\"serial\":\"%s\",\"consoleId\":\"%s\"}", serial, client_id);
+                snprintf(prepare_msg, sizeof(prepare_msg),
+                    "{\"type\":\"prepareStream\",\"serial\":\"%s\",\"consoleId\":\"%s\"}",
+                    serial, client_id);
                 if (send_websocket_message(prepare_msg)) {
                     print_log("INFO", "已预注册设备推流: %s", serial);
                 } else {
                     print_log("ERROR", "预注册设备推流失败: %s", serial);
+                    report_start_device_failed(serial, "prepare_stream_failed", "预注册设备推流失败，请稍后重试");
+                    return;
                 }
                 
                 // 等待一小段时间确保服务器处理预注册
@@ -1012,7 +1147,8 @@ void handle_server_message(const char* message) {
                 // --video-codec-options profile:int=1: 强制使用 H.264 Baseline Profile
                 //   (1 = AVCProfileBaseline, 浏览器 WebCodecs 兼容性最好)
                 // 直接启动scrcpy.exe以获取正确的进程ID
-                sprintf(scrcpy_cmd, ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
+                snprintf(scrcpy_cmd, sizeof(scrcpy_cmd),
+                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
                     serial, target_server);
 
                 print_log("INFO", "启动命令: %s", scrcpy_cmd);
@@ -1031,13 +1167,8 @@ void handle_server_message(const char* message) {
                 if (CreateProcessA(NULL, scrcpy_cmd, NULL, NULL, FALSE, 
                                   0, NULL, NULL, &si, &pi)) {
                     // 记录进程 ID
-                    for (int i = 0; i < device_count; i++) {
-                        if (strcmp(devices[i].serial, serial) == 0) {
-                            devices[i].process_id = pi.dwProcessId;
-                            devices[i].streaming = true;
-                            break;
-                        }
-                    }
+                    devices[device_index].process_id = pi.dwProcessId;
+                    devices[device_index].streaming = true;
                     
                     CloseHandle(pi.hProcess);
                     CloseHandle(pi.hThread);
@@ -1046,14 +1177,18 @@ void handle_server_message(const char* message) {
 
                     // 通知服务器已开始推流
                     char notify_msg[512];
-                    sprintf(notify_msg,
+                    snprintf(notify_msg, sizeof(notify_msg),
                         "{\"type\":\"startStreaming\",\"serial\":\"%s\"}",
                         serial);
                     send_websocket_message(notify_msg);
 
                     // WebRTC Offer 将在 scrcpy 连接到本地服务器后由回调触发创建
                 } else {
-                    print_log("ERROR", "启动设备 %s 失败，错误代码: %lu", serial, GetLastError());
+                    DWORD last_error = GetLastError();
+                    print_log("ERROR", "启动设备 %s 失败，错误代码: %lu", serial, last_error);
+                    char fail_reason[256];
+                    snprintf(fail_reason, sizeof(fail_reason), "启动 scrcpy 失败，错误码: %lu", last_error);
+                    report_start_device_failed(serial, "scrcpy_launch_failed", fail_reason);
                 }
             } else {
                 print_log("ERROR", "无法解析设备序列号");

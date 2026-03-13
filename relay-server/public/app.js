@@ -440,6 +440,10 @@ function handleTextMessage(data) {
             case 'error':
                 showError(message.message);
                 break;
+            case 'startDeviceFailed':
+                showError(message.message || '设备启动失败');
+                console.error('[DEVICE] 启动失败:', message);
+                break;
 
             // ========== WebRTC 信令消息 ==========
             case 'webrtc-offer':

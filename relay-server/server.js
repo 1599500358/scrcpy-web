@@ -409,6 +409,12 @@ function splitDeviceId(deviceId) {
     ];
 }
 
+function sendWsJson(ws, payload) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+    }
+}
+
 // WebSocket 连接处理函数（共用）
 function handleWebSocketConnection(ws, req) {
     const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
@@ -819,6 +825,24 @@ function handleConsoleMessage(consoleId, msg) {
             }
             break;
 
+        case 'startDeviceFailed':
+            if (msg.serial) {
+                log('WARN', `[控制台] ${consoleId} 启动设备失败: serial=${msg.serial}, reason=${msg.reason || 'unknown'}, message=${msg.message || ''}`);
+                const targetDeviceId = `${consoleId}:${msg.serial}`;
+                webClients.forEach((client) => {
+                    if (client.currentDevice === targetDeviceId) {
+                        sendWsJson(client.ws, {
+                            type: 'startDeviceFailed',
+                            deviceId: targetDeviceId,
+                            serial: msg.serial,
+                            reason: msg.reason || 'unknown',
+                            message: msg.message || '控制台启动 scrcpy 失败'
+                        });
+                    }
+                });
+            }
+            break;
+
         // ========== WebRTC 信令处理 ==========
         case 'webrtc-offer':
             // 控制台发送 WebRTC Offer
@@ -869,33 +893,91 @@ function handleWebMessage(clientId, msg) {
             if (webClient.currentDevice) {
                 removeViewerFromIndex(webClient.currentDevice, webClient.ws);
             }
-            
-            webClient.currentDevice = msg.deviceId;
+
             log('INFO', `[Web客户端] ${clientId} 选择了设备 ${msg.deviceId}`);
-            
-            // 添加到观看者索引
-            addViewerToIndex(msg.deviceId, webClient.ws);
-            
-            // 查找设备并发送缓存的关键帧（如果有）
+
+            if (!msg.deviceId || typeof msg.deviceId !== 'string') {
+                webClient.currentDevice = null;
+                sendWsJson(webClient.ws, {
+                    type: 'startDeviceFailed',
+                    reason: 'invalid_device_id',
+                    message: '设备ID无效'
+                });
+                break;
+            }
+
             const [consoleId, serial] = splitDeviceId(msg.deviceId);
             log('DEBUG', `[Web客户端] 解析设备ID: consoleId=${consoleId}, serial=${serial}`);
-            
+
             const consoleClient = consoleClients.get(consoleId);
-            if (consoleClient) {
-                log('DEBUG', `[Web客户端] 找到控制台客户端: ${consoleId}`);
-                // 通知控制台启动该设备的推流
-                if (consoleClient.ws.readyState === WebSocket.OPEN) {
-                    consoleClient.ws.send(JSON.stringify({
-                        type: 'startDevice',
-                        serial: serial
-                    }));
-                    log('INFO', `[Web客户端] 已发送startDevice消息到控制台: ${consoleId}`);
-                } else {
-                    log('WARN', `[Web客户端] 控制台连接状态异常: ${consoleClient.ws.readyState}`);
-                }
-            } else {
+            if (!consoleClient) {
+                webClient.currentDevice = null;
                 log('WARN', `[Web客户端] 未找到控制台客户端: ${consoleId}`);
                 log('DEBUG', `[Web客户端] 当前可用的控制台客户端:`, Array.from(consoleClients.keys()));
+                sendWsJson(webClient.ws, {
+                    type: 'startDeviceFailed',
+                    deviceId: msg.deviceId,
+                    serial,
+                    reason: 'console_not_found',
+                    message: '控制台不在线，请刷新后重试'
+                });
+                break;
+            }
+
+            const device = consoleClient.devices.get(serial);
+            if (!device) {
+                webClient.currentDevice = null;
+                log('WARN', `[Web客户端] 选择的设备不存在于控制台缓存: ${msg.deviceId}`);
+                sendWsJson(webClient.ws, {
+                    type: 'startDeviceFailed',
+                    deviceId: msg.deviceId,
+                    serial,
+                    reason: 'device_not_found',
+                    message: '设备不存在或已离线，请刷新设备列表'
+                });
+                break;
+            }
+
+            if (device.state && device.state !== 'device') {
+                webClient.currentDevice = null;
+                log('WARN', `[Web客户端] 设备状态不可启动: ${serial}, state=${device.state}`);
+                sendWsJson(webClient.ws, {
+                    type: 'startDeviceFailed',
+                    deviceId: msg.deviceId,
+                    serial,
+                    reason: 'device_not_ready',
+                    message: `设备当前状态为 ${device.state}，无法启动推流`
+                });
+                break;
+            }
+
+            // 验证通过后，才设置当前观看设备并加入索引
+            webClient.currentDevice = msg.deviceId;
+            addViewerToIndex(msg.deviceId, webClient.ws);
+
+            // 避免重复启动：设备已在推流时无需再次拉起 scrcpy
+            if (device.videoWs && device.videoWs.readyState === WebSocket.OPEN) {
+                log('INFO', `[Web客户端] 设备已在推流，跳过重复启动: ${serial}`);
+                break;
+            }
+
+            if (consoleClient.ws.readyState === WebSocket.OPEN) {
+                sendWsJson(consoleClient.ws, {
+                    type: 'startDevice',
+                    serial: serial
+                });
+                log('INFO', `[Web客户端] 已发送startDevice消息到控制台: ${consoleId}`);
+            } else {
+                webClient.currentDevice = null;
+                removeViewerFromIndex(msg.deviceId, webClient.ws);
+                log('WARN', `[Web客户端] 控制台连接状态异常: ${consoleClient.ws.readyState}`);
+                sendWsJson(webClient.ws, {
+                    type: 'startDeviceFailed',
+                    deviceId: msg.deviceId,
+                    serial,
+                    reason: 'console_ws_unavailable',
+                    message: '控制台连接异常，无法下发启动指令'
+                });
             }
             break;
             
