@@ -450,10 +450,20 @@ bool send_websocket_message(const char* message) {
     if (result) {
         print_log("DEBUG", "WebSocket消息发送成功");
     }
-    
+
     free(frame);
     return result;
 }
+
+#ifdef USE_WEBRTC
+// WebRTC 信令消息回调函数
+void webrtc_send_signaling_message(const char* device_id, const char* message) {
+    if (!device_id || !message) return;
+
+    print_log("DEBUG", "[WebRTC] 发送信令消息: %s", message);
+    send_websocket_message(message);
+}
+#endif
 
 // ADB 路径解析（只查找一次并缓存结果）
 const char* resolve_adb_path() {
@@ -994,13 +1004,36 @@ void handle_server_message(const char* message) {
                     CloseHandle(pi.hThread);
                     
                     print_log("SUCCESS", "已启动设备 %s 的镜像，进程 ID: %lu", serial, pi.dwProcessId);
-                    
+
                     // 通知服务器已开始推流
                     char notify_msg[512];
-                    sprintf(notify_msg, 
+                    sprintf(notify_msg,
                         "{\"type\":\"startStreaming\",\"serial\":\"%s\"}",
                         serial);
                     send_websocket_message(notify_msg);
+
+#ifdef USE_WEBRTC
+                    // 如果 WebRTC 启用，创建 WebRTC Offer
+                    if (g_webrtc_enabled) {
+                        // 构建完整的 deviceId (consoleId:serial)
+                        char full_device_id[512];
+                        snprintf(full_device_id, sizeof(full_device_id), "%s:%s", client_id, serial);
+
+                        print_log("INFO", "[WebRTC] 创建 Offer for device %s", full_device_id);
+
+                        // 设置消息回调，用于发送 WebRTC 信令
+                        webrtc_set_message_callback(webrtc_send_signaling_message);
+
+                        // 创建 Offer
+                        char* offer = webrtc_create_offer(full_device_id);
+                        if (offer) {
+                            print_log("INFO", "[WebRTC] Offer 已创建");
+                            free(offer);
+                        } else {
+                            print_log("WARN", "[WebRTC] 创建 Offer 失败，使用 WebSocket 模式");
+                        }
+                    }
+#endif
                 } else {
                     print_log("ERROR", "启动设备 %s 失败，错误代码: %lu", serial, GetLastError());
                 }

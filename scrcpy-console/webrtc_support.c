@@ -97,11 +97,47 @@ static void on_local_description(int pc, const char* sdp, const char* type, void
     if (conn && sdp) {
         strncpy(conn->local_sdp, sdp, SDP_BUFFER_SIZE - 1);
 
+        // 转义 SDP 字符串中的特殊字符（换行符等）
+        char* escaped_sdp = (char*)malloc(SDP_BUFFER_SIZE * 2);
+        if (!escaped_sdp) {
+            printf("[WebRTC] 内存分配失败\n");
+            return;
+        }
+
+        const char* src = sdp;
+        char* dst = escaped_sdp;
+        while (*src && (dst - escaped_sdp) < (SDP_BUFFER_SIZE * 2 - 2)) {
+            switch (*src) {
+                case '\n':
+                    *dst++ = '\\';
+                    *dst++ = 'n';
+                    break;
+                case '\r':
+                    *dst++ = '\\';
+                    *dst++ = 'r';
+                    break;
+                case '"':
+                    *dst++ = '\\';
+                    *dst++ = '"';
+                    break;
+                case '\\':
+                    *dst++ = '\\';
+                    *dst++ = '\\';
+                    break;
+                default:
+                    *dst++ = *src;
+            }
+            src++;
+        }
+        *dst = '\0';
+
         // 构造 JSON 格式的 Offer 消息
-        char message[SDP_BUFFER_SIZE + 256];
+        char message[SDP_BUFFER_SIZE * 2 + 512];
         snprintf(message, sizeof(message),
             "{\"type\":\"webrtc-offer\",\"deviceId\":\"%s\",\"sdp\":{\"type\":\"offer\",\"sdp\":\"%s\"}}",
-            conn->device_id, sdp);
+            conn->device_id, escaped_sdp);
+
+        free(escaped_sdp);
 
         // 发送 Offer 到信令服务器
         if (g_message_callback) {
@@ -122,11 +158,27 @@ static void on_ice_candidate(int pc, const char* candidate, const char* mid, voi
             conn->ice_count++;
         }
 
+        // 转义 candidate 字符串
+        char escaped_candidate[1024];
+        const char* src = candidate;
+        char* dst = escaped_candidate;
+        while (*src && (dst - escaped_candidate) < sizeof(escaped_candidate) - 2) {
+            switch (*src) {
+                case '\n': *dst++ = '\\'; *dst++ = 'n'; break;
+                case '\r': *dst++ = '\\'; *dst++ = 'r'; break;
+                case '"': *dst++ = '\\'; *dst++ = '"'; break;
+                case '\\': *dst++ = '\\'; *dst++ = '\\'; break;
+                default: *dst++ = *src;
+            }
+            src++;
+        }
+        *dst = '\0';
+
         // 构造 ICE candidate 消息
-        char message[1024];
+        char message[2048];
         snprintf(message, sizeof(message),
             "{\"type\":\"webrtc-ice-candidate\",\"deviceId\":\"%s\",\"candidate\":{\"candidate\":\"%s\",\"sdpMid\":\"%s\"},\"from\":\"console\"}",
-            conn->device_id, candidate, mid ? mid : "0");
+            conn->device_id, escaped_candidate, mid ? mid : "0");
 
         // 发送 ICE candidate 到信令服务器
         if (g_message_callback) {
