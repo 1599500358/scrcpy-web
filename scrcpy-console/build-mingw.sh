@@ -70,7 +70,7 @@ if [ $ENABLE_WEBRTC -eq 1 ]; then
 
     if [ -f "$VCPKG_INSTALLED/include/rtc/rtc.h" ]; then
         echo "使用 vcpkg 安装的 libdatachannel..."
-        SOURCES="$SOURCES webrtc_support.c"
+        SOURCES="$SOURCES webrtc_support.c local_video_relay.c"
         LIBS="$LIBS -L$VCPKG_INSTALLED/lib -ldatachannel -ljuice -lusrsctp -lssl -lcrypto -lws2_32 -liphlpapi -lcrypt32 -lsecur32 -lbcrypt -lstdc++"
         CFLAGS="$CFLAGS -DUSE_WEBRTC -I$VCPKG_INSTALLED/include"
         # 使用 g++ 进行链接以支持 C++ 标准库
@@ -78,7 +78,7 @@ if [ $ENABLE_WEBRTC -eq 1 ]; then
         echo "WebRTC 库已找到，开始编译..."
     elif [ -f "libdatachannel/include/rtc/rtc.h" ]; then
         echo "使用本地 libdatachannel..."
-        SOURCES="$SOURCES webrtc_support.c"
+        SOURCES="$SOURCES webrtc_support.c local_video_relay.c"
         LIBS="$LIBS -Llibdatachannel/lib -ldatachannel -lssl -lcrypto -lz"
         CFLAGS="$CFLAGS -DUSE_WEBRTC -Ilibdatachannel/include"
         echo "WebRTC 库已找到，开始编译..."

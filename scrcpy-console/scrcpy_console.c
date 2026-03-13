@@ -15,6 +15,7 @@
 // WebRTC 支持（可选，编译时使用 -D USE_WEBRTC 启用）
 #ifdef USE_WEBRTC
 #include "webrtc_support.h"
+#include "local_video_relay.h"
 #endif
 
 // WIC 接口 GUID 声明（使用 extern 避免重复定义）
@@ -167,6 +168,14 @@ int main(int argc, char* argv[]) {
     g_webrtc_enabled = webrtc_init(&g_webrtc_config);
     if (g_webrtc_enabled) {
         print_log("SUCCESS", "WebRTC 初始化成功");
+
+        // 初始化本地视频转发服务器
+        if (init_local_video_relay()) {
+            print_log("SUCCESS", "本地视频转发服务器已启动，端口: %d", get_local_video_port());
+        } else {
+            print_log("ERROR", "本地视频转发服务器启动失败");
+            g_webrtc_enabled = false;
+        }
     } else {
         print_log("WARNING", "WebRTC 初始化失败，将使用 WebSocket 模式");
     }
@@ -946,10 +955,25 @@ void handle_server_message(const char* message) {
                 
                 // 等待一小段时间确保服务器处理预注册
                 Sleep(500);
-                
+
                 // 启动 scrcpy 推流
                 char scrcpy_cmd[1024];
-                
+                char* target_server;
+
+#ifdef USE_WEBRTC
+                // WebRTC 模式：scrcpy 连接本地服务器，控制台通过 WebRTC 转发
+                if (g_webrtc_enabled) {
+                    static char local_server_addr[64];
+                    snprintf(local_server_addr, sizeof(local_server_addr), "127.0.0.1:%d", get_local_video_port());
+                    target_server = local_server_addr;
+                    print_log("INFO", "[WebRTC] scrcpy 将连接本地转发服务器: %s", target_server);
+                } else {
+                    target_server = server_url;
+                }
+#else
+                target_server = server_url;
+#endif
+
                 // 构建 scrcpy 命令 - 使用 WebSocket 推流模式
                 // 使用当前目录的 scrcpy.exe（确保使用编译的新版本）
                 // --websocket-server: 连接到中继服务器
@@ -958,11 +982,11 @@ void handle_server_message(const char* message) {
                 // --video-codec-options profile:int=1: 强制使用 H.264 Baseline Profile
                 //   (1 = AVCProfileBaseline, 浏览器 WebCodecs 兼容性最好)
                 // 直接启动scrcpy.exe以获取正确的进程ID
-                sprintf(scrcpy_cmd, ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1", 
-                    serial, server_url);
-                
+                sprintf(scrcpy_cmd, ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
+                    serial, target_server);
+
                 print_log("INFO", "启动命令: %s", scrcpy_cmd);
-                print_log("INFO", "WebSocket 中继服务器: %s", server_url);
+                print_log("INFO", "WebSocket 目标服务器: %s", target_server);
                 
                 // 使用 CreateProcess 启动，以便获取进程 ID
                 STARTUPINFOA si;
@@ -1211,6 +1235,18 @@ void handle_server_message(const char* message) {
 
 // 停止设备推流
 void stop_device(const char* serial) {
+#ifdef USE_WEBRTC
+    // 关闭本地客户端连接
+    if (g_webrtc_enabled) {
+        close_local_client(serial);
+
+        // 关闭 WebRTC 连接
+        char device_id[512];
+        snprintf(device_id, sizeof(device_id), "%s:%s", client_id, serial);
+        webrtc_close(device_id);
+    }
+#endif
+
     for (int i = 0; i < device_count; i++) {
         if (strcmp(devices[i].serial, serial) == 0 && devices[i].streaming) {
             if (devices[i].process_id != 0) {
@@ -1227,7 +1263,7 @@ void stop_device(const char* serial) {
                 } else {
                     print_log("WARNING", "无法打开进程 %lu", devices[i].process_id);
                 }
-                
+
                 devices[i].process_id = 0;
                 devices[i].streaming = false;
             }
@@ -1379,8 +1415,9 @@ void cleanup() {
     stop_all_devices();
 
 #ifdef USE_WEBRTC
-    // 清理 WebRTC 资源
+    // 先停止本地视频转发服务器
     if (g_webrtc_enabled) {
+        stop_local_video_relay();
         webrtc_cleanup();
         g_webrtc_enabled = false;
     }
@@ -1390,7 +1427,7 @@ void cleanup() {
         closesocket(ws_socket);
     }
     WSACleanup();
-    
+
     print_log("INFO", "程序已退出");
 }
 
