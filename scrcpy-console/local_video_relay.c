@@ -39,6 +39,14 @@ static HANDLE local_server_thread = NULL;
 extern void print_log(const char* level, const char* format, ...);
 extern char client_id[64];
 
+// 视频连接建立回调
+static VideoConnectCallback g_video_connect_callback = NULL;
+
+// 设置视频连接建立回调
+void set_video_connect_callback(VideoConnectCallback callback) {
+    g_video_connect_callback = callback;
+}
+
 // 查找本地客户端
 static LocalScrcpyClient* find_local_client(const char* serial) {
     for (int i = 0; i < local_client_count; i++) {
@@ -277,6 +285,11 @@ static unsigned __stdcall local_server_listener(void* param) {
                         if (client->video_socket == INVALID_SOCKET) {
                             client->video_socket = client_sock;
                             print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
+
+                            // 调用回调通知主程序（触发 WebRTC Offer 创建）
+                            if (g_video_connect_callback) {
+                                g_video_connect_callback(serial);
+                            }
 
                             // 启动视频转发线程
                             HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, video_relay_thread, client, 0, NULL);

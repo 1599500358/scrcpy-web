@@ -100,6 +100,10 @@ void stop_device(const char* serial);
 void stop_all_devices();
 void capture_device_screenshot(int device_index);
 void load_device_names();
+#ifdef USE_WEBRTC
+void webrtc_send_signaling_message(const char* device_id, const char* message);
+void on_video_connected(const char* serial);
+#endif
 void save_device_name(const char* serial, const char* custom_name);
 void base64_encode(const unsigned char* input, int length, char* output);
 unsigned __stdcall capture_screenshot_thread(void* param);
@@ -168,6 +172,9 @@ int main(int argc, char* argv[]) {
     g_webrtc_enabled = webrtc_init(&g_webrtc_config);
     if (g_webrtc_enabled) {
         print_log("SUCCESS", "WebRTC 初始化成功");
+
+        // 设置视频连接回调
+        set_video_connect_callback(on_video_connected);
 
         // 初始化本地视频转发服务器
         if (init_local_video_relay()) {
@@ -466,6 +473,29 @@ void webrtc_send_signaling_message(const char* device_id, const char* message) {
 
     print_log("DEBUG", "[WebRTC] 发送信令消息: %s", message);
     send_websocket_message(message);
+}
+
+// 视频连接建立回调函数（由 local_video_relay 调用）
+void on_video_connected(const char* serial) {
+    if (!serial) return;
+
+    print_log("INFO", "[WebRTC] 视频连接已建立，创建 WebRTC Offer: %s", serial);
+
+    // 构建完整的 deviceId (consoleId:serial)
+    char full_device_id[512];
+    snprintf(full_device_id, sizeof(full_device_id), "%s:%s", client_id, serial);
+
+    // 设置消息回调
+    webrtc_set_message_callback(webrtc_send_signaling_message);
+
+    // 创建 WebRTC Offer
+    char* offer = webrtc_create_offer(full_device_id);
+    if (offer) {
+        print_log("INFO", "[WebRTC] Offer 已创建");
+        free(offer);
+    } else {
+        print_log("WARN", "[WebRTC] 创建 Offer 失败");
+    }
 }
 #endif
 
@@ -1021,28 +1051,7 @@ void handle_server_message(const char* message) {
                         serial);
                     send_websocket_message(notify_msg);
 
-#ifdef USE_WEBRTC
-                    // 如果 WebRTC 启用，创建 WebRTC Offer
-                    if (g_webrtc_enabled) {
-                        // 构建完整的 deviceId (consoleId:serial)
-                        char full_device_id[512];
-                        snprintf(full_device_id, sizeof(full_device_id), "%s:%s", client_id, serial);
-
-                        print_log("INFO", "[WebRTC] 创建 Offer for device %s", full_device_id);
-
-                        // 设置消息回调，用于发送 WebRTC 信令
-                        webrtc_set_message_callback(webrtc_send_signaling_message);
-
-                        // 创建 Offer
-                        char* offer = webrtc_create_offer(full_device_id);
-                        if (offer) {
-                            print_log("INFO", "[WebRTC] Offer 已创建");
-                            free(offer);
-                        } else {
-                            print_log("WARN", "[WebRTC] 创建 Offer 失败，使用 WebSocket 模式");
-                        }
-                    }
-#endif
+                    // WebRTC Offer 将在 scrcpy 连接到本地服务器后由回调触发创建
                 } else {
                     print_log("ERROR", "启动设备 %s 失败，错误代码: %lu", serial, GetLastError());
                 }

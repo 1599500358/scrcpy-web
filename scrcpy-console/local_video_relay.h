@@ -12,6 +12,9 @@
 extern "C" {
 #endif
 
+// 视频连接建立回调类型
+typedef void (*VideoConnectCallback)(const char* serial);
+
 // 初始化本地视频转发服务器
 bool init_local_video_relay(void);
 
@@ -26,6 +29,9 @@ void close_local_client(const char* serial);
 
 // 发送控制消息到 scrcpy
 bool send_control_to_scrcpy(const char* serial, const uint8_t* data, size_t len);
+
+// 设置视频连接建立回调
+void set_video_connect_callback(VideoConnectCallback callback);
 
 #ifdef __cplusplus
 }
