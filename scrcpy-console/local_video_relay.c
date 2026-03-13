@@ -226,6 +226,9 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
     print_log("INFO", "[LocalRelay] 视频转发线程启动: %s", client->serial);
 
+    int frame_count = 0;
+    int drop_count = 0;
+
     while (client->active && client->video_socket != INVALID_SOCKET) {
         int len = recv_ws_frame(client->video_socket, video_buffer, VIDEO_BUFFER_SIZE);
         if (len <= 0) {
@@ -233,18 +236,37 @@ static unsigned __stdcall video_relay_thread(void* param) {
             break;
         }
 
+        frame_count++;
+
         // 通过 WebRTC DataChannel 发送
         char device_id[512];
         extern char client_id[64];
         snprintf(device_id, sizeof(device_id), "%s:%s", client_id, client->serial);
 
-        if (webrtc_get_state(device_id) == WEBRTC_STATE_CONNECTED) {
-            webrtc_send_video(device_id, video_buffer, len);
+        WebRTCState state = webrtc_get_state(device_id);
+        if (state == WEBRTC_STATE_CONNECTED) {
+            bool sent = webrtc_send_video(device_id, video_buffer, len);
+            if (!sent) {
+                drop_count++;
+                if (drop_count < 5) {
+                    print_log("WARN", "[LocalRelay] WebRTC 发送失败: %s", client->serial);
+                }
+            }
+        } else {
+            drop_count++;
+            if (drop_count == 1 || drop_count % 100 == 0) {
+                print_log("WARN", "[LocalRelay] WebRTC 未连接 (state=%d), 丢帧: %d", state, drop_count);
+            }
+        }
+
+        // 每 100 帧打印一次统计
+        if (frame_count % 100 == 0) {
+            print_log("DEBUG", "[LocalRelay] %s: 已处理 %d 帧, 丢弃 %d 帧", client->serial, frame_count, drop_count);
         }
     }
 
     free(video_buffer);
-    print_log("INFO", "[LocalRelay] 视频转发线程结束: %s", client->serial);
+    print_log("INFO", "[LocalRelay] 视频转发线程结束: %s, 总帧数: %d, 丢弃: %d", client->serial, frame_count, drop_count);
     return 0;
 }
 

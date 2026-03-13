@@ -49,7 +49,10 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
         return;
     }
 
-    console.log(`[WebRTC] 收到控制台 ${consoleId} 的 offer，设备: ${deviceId}`);
+    console.log(`[WebRTC] ========== 收到 Offer ==========`);
+    console.log(`[WebRTC] 控制台: ${consoleId}`);
+    console.log(`[WebRTC] 设备: ${deviceId}`);
+    console.log(`[WebRTC] SDP 类型: ${sdp.type}`);
 
     // 存储连接信息
     pendingConnections.set(deviceId, {
@@ -66,21 +69,21 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
     console.log(`[WebRTC] 查找 Web 客户端，当前 webClients 数量: ${webClients.size}`);
 
     webClients.forEach((client, clientId) => {
-        console.log(`[WebRTC] 检查 Web 客户端 ${clientId}, currentDevice: ${client.currentDevice}, 目标: ${deviceId}`);
+        console.log(`[WebRTC]   检查 ${clientId}: currentDevice="${client.currentDevice}", 目标="${deviceId}", 匹配: ${client.currentDevice === deviceId}`);
         if (client.currentDevice === deviceId) {
             targetWebClient = { ws: client.ws, clientId };
-            console.log(`[WebRTC] 找到匹配的 Web 客户端 ${clientId}`);
         }
     });
 
     if (targetWebClient && targetWebClient.ws.readyState === 1) { // WebSocket.OPEN
-        // 转发 offer 给 Web 客户端
-        targetWebClient.ws.send(JSON.stringify({
+        const offerMsg = JSON.stringify({
             type: 'webrtc-offer',
             deviceId,
             sdp,
             consoleId
-        }));
+        });
+
+        targetWebClient.ws.send(offerMsg);
 
         // 更新连接信息
         const conn = pendingConnections.get(deviceId);
@@ -88,9 +91,12 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
             conn.webWs = targetWebClient.ws;
         }
 
-        console.log(`[WebRTC] Offer 已转发给 Web 客户端 ${targetWebClient.clientId}`);
+        console.log(`[WebRTC] ✅ Offer 已转发给 Web 客户端 ${targetWebClient.clientId}`);
+        console.log(`[WebRTC] ================================`);
     } else {
-        console.log(`[WebRTC] 未找到观看设备 ${deviceId} 的 Web 客户端，Offer 已缓存`);
+        console.log(`[WebRTC] ❌ 未找到观看设备 ${deviceId} 的 Web 客户端`);
+        console.log(`[WebRTC]   原因: ${!targetWebClient ? '没有匹配的客户端' : '连接状态异常 (' + targetWebClient.ws.readyState + ')'}`);
+        console.log(`[WebRTC] ================================`);
 
         // 通知控制台等待 Web 客户端
         consoleWs.send(JSON.stringify({
