@@ -1068,20 +1068,26 @@ function handleWebMessage(clientId, msg) {
                 const consoleClient = consoleClients.get(consoleId);
                 if (consoleClient) {
                     const device = consoleClient.devices.get(serial);
+                    // 统一控制消息格式，便于 console 透传到本地 relay control 通道
+                    const touchMsg = {
+                        type: 'control',
+                        serial,
+                        action: 'touch',
+                        touchType: msg.action,  // down/move/up
+                        x: msg.x,
+                        y: msg.y,
+                        width: msg.width,
+                        height: msg.height
+                    };
+
                     if (device && device.controlWs && device.controlWs.readyState === WebSocket.OPEN) {
-                        // 发送触摸事件
-                        const touchMsg = {
-                            type: 'touch',
-                            action: 'touch',  // 总动作类型
-                            touchType: msg.action,  // down/move/up
-                            x: msg.x,
-                            y: msg.y,
-                            width: msg.width,
-                            height: msg.height
-                        };
-                        
+                        // 直连 scrcpy 控制通道
                         device.controlWs.send(JSON.stringify(touchMsg));
-                        log('DEBUG', `[Web客户端] ${clientId} 发送触摸: ${msg.action} at (${msg.x}, ${msg.y})`);
+                        log('DEBUG', `[Web客户端] ${clientId} 直连发送触摸: ${msg.action} at (${msg.x}, ${msg.y})`);
+                    } else if (consoleClient.ws && consoleClient.ws.readyState === WebSocket.OPEN) {
+                        // 回退：通过 console ws 发送，再由 console 转发给本地 relay/scrcpy
+                        sendWsJson(consoleClient.ws, touchMsg);
+                        log('DEBUG', `[Web客户端] ${clientId} 经控制台转发触摸: ${msg.action} at (${msg.x}, ${msg.y})`);
                     } else {
                         log('WARN', `[Web客户端] ${clientId} 设备 ${serial} 控制连接不可用`);
                     }
@@ -1097,14 +1103,20 @@ function handleWebMessage(clientId, msg) {
                 const consoleClient = consoleClients.get(consoleId);
                 if (consoleClient) {
                     const device = consoleClient.devices.get(serial);
+                    const controlMsg = {
+                        type: 'control',
+                        serial,
+                        action: msg.action
+                    };
+
                     if (device && device.controlWs && device.controlWs.readyState === WebSocket.OPEN) {
-                        const controlMsg = {
-                            type: 'control',
-                            action: msg.action
-                        };
-                        
+                        // 直连 scrcpy 控制通道
                         device.controlWs.send(JSON.stringify(controlMsg));
-                        log('INFO', `[Web客户端] ${clientId} 发送控制: ${msg.action}`);
+                        log('INFO', `[Web客户端] ${clientId} 直连发送控制: ${msg.action}`);
+                    } else if (consoleClient.ws && consoleClient.ws.readyState === WebSocket.OPEN) {
+                        // 回退：通过 console ws
+                        sendWsJson(consoleClient.ws, controlMsg);
+                        log('INFO', `[Web客户端] ${clientId} 经控制台转发控制: ${msg.action}`);
                     }
                 }
             }
