@@ -101,12 +101,23 @@ static void on_dc_closed(int dc, void* ptr) {
 static void on_dc_message(int dc, const char* message, int size, void* ptr) {
     (void)ptr;
     DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(dc);
-    if (!conn || !message || size <= 0) {
+    if (!conn || !message) {
+        return;
+    }
+
+    size_t payload_len = 0;
+    // libdatachannel: 文本消息可能返回 size=-1（以 '\0' 结尾）
+    if (size < 0) {
+        payload_len = strlen(message);
+    } else {
+        payload_len = (size_t)size;
+    }
+    if (payload_len == 0) {
         return;
     }
 
     if (g_data_message_callback) {
-        g_data_message_callback(conn->device_id, (const uint8_t*)message, (size_t)size);
+        g_data_message_callback(conn->device_id, (const uint8_t*)message, payload_len);
     }
 }
 
