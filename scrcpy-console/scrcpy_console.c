@@ -1190,8 +1190,8 @@ void handle_server_message(const char* message) {
                     return;
                 }
                 
-                // 等待一小段时间确保服务器处理预注册
-                Sleep(500);
+                // 轻量等待，避免过长阻塞首帧启动
+                Sleep(100);
 
                 // 启动 scrcpy 推流
                 char* target_server;
@@ -1232,7 +1232,10 @@ void handle_server_message(const char* message) {
                     serial, target_server);
                 use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
 #ifdef USE_WEBRTC
-                if (g_webrtc_enabled && strcmp(target_server, server_url) != 0) {
+                // 极速模式：WebRTC 启用时只使用本地 relay，不再回退到远端直连
+                if (g_webrtc_enabled) {
+                    // no-op
+                } else if (strcmp(target_server, server_url) != 0) {
                     snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                         ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --max-size=1024",
                         serial, server_url);
@@ -1293,8 +1296,8 @@ void handle_server_message(const char* message) {
                         continue;
                     }
 
-                    // 2秒内退出视为本次尝试失败（常见于编码参数或WS目标不兼容）
-                    DWORD wait_result = WaitForSingleObject(pi.hProcess, 2000);
+                    // 1.2秒内退出视为本次尝试失败（减少单次失败耗时）
+                    DWORD wait_result = WaitForSingleObject(pi.hProcess, 1200);
                     if (wait_result == WAIT_OBJECT_0) {
                         GetExitCodeProcess(pi.hProcess, &last_exit_code);
                         print_log("WARNING", "第 %d 次启动后快速退出 (exit=%lu): %s", i + 1, last_exit_code, start_cmds[i]);
@@ -1311,7 +1314,7 @@ void handle_server_message(const char* message) {
                     // 本地 relay 模式必须看到实际视频连接，才算真正成功
                     if (g_webrtc_enabled && use_local_relay[i]) {
                         bool got_video_connection = false;
-                        for (int k = 0; k < 100; k++) { // 最多等待 10 秒
+                        for (int k = 0; k < 30; k++) { // 最多等待 3 秒
                             Sleep(100);
                             if (g_video_connect_version > version_before_launch &&
                                 strcmp(g_last_video_connected_serial, serial) == 0) {
@@ -1418,10 +1421,16 @@ void handle_server_message(const char* message) {
                 
                 print_log("INFO", "Web客户端请求设备 %s 的关键帧", serial);
                 
-                // 向scrcpy进程发送信号请求关键帧
-                // 这里可以通过向scrcpy进程发送特定信号或使用其他IPC机制
-                // 暂时记录请求，实际实现需要修改scrcpy源码
-                print_log("INFO", "已向scrcpy进程转发关键帧请求: %s", serial);
+                static const char* reset_msg = "{\"type\":\"control\",\"action\":\"resetVideo\"}";
+#ifdef USE_WEBRTC
+                if (send_control_to_scrcpy(serial, (const uint8_t*)reset_msg, strlen(reset_msg))) {
+                    print_log("INFO", "已向scrcpy进程转发关键帧请求: %s", serial);
+                } else {
+                    print_log("WARN", "关键帧请求转发失败（控制通道不可用）: %s", serial);
+                }
+#else
+                print_log("INFO", "关键帧请求未启用（当前非WebRTC模式）: %s", serial);
+#endif
             }
         }
     } else if (strstr(message, "\"type\":\"updateDeviceName\"")) {

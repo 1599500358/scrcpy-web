@@ -36,6 +36,7 @@ typedef struct {
     int cached_sps_len;
     uint8_t cached_pps[1024];
     int cached_pps_len;
+    DWORD last_keyframe_request_tick;
 } LocalScrcpyClient;
 
 static LocalScrcpyClient local_clients[MAX_LOCAL_CLIENTS];
@@ -88,6 +89,7 @@ static LocalScrcpyClient* create_local_client(const char* serial) {
             local_clients[i].webrtc_stream_ready = false;
             local_clients[i].cached_sps_len = 0;
             local_clients[i].cached_pps_len = 0;
+            local_clients[i].last_keyframe_request_tick = 0;
             if (i >= local_client_count) {
                 local_client_count = i + 1;
             }
@@ -438,6 +440,17 @@ static void update_h264_cache(LocalScrcpyClient* client, const uint8_t* data, in
     }
 }
 
+static void request_scrcpy_keyframe(LocalScrcpyClient* client) {
+    if (!client || client->control_socket == INVALID_SOCKET) {
+        return;
+    }
+
+    static const char* reset_msg = "{\"type\":\"control\",\"action\":\"resetVideo\"}";
+    if (ws_send_unmasked(client->control_socket, (const uint8_t*)reset_msg, strlen(reset_msg)) > 0) {
+        print_log("INFO", "[LocalRelay] 已请求关键帧: %s", client->serial);
+    }
+}
+
 // 视频数据转发线程
 static unsigned __stdcall video_relay_thread(void* param) {
     LocalScrcpyClient* client = (LocalScrcpyClient*)param;
@@ -483,6 +496,12 @@ static unsigned __stdcall video_relay_thread(void* param) {
                 // 仅在拿到 SPS/PPS + IDR 后开始推流，确保浏览器端可立即起解码
                 if (!has_idr || client->cached_sps_len <= 0 || client->cached_pps_len <= 0) {
                     drop_count++;
+                    DWORD now = GetTickCount();
+                    if (client->last_keyframe_request_tick == 0 ||
+                        now - client->last_keyframe_request_tick >= 1000) {
+                        request_scrcpy_keyframe(client);
+                        client->last_keyframe_request_tick = now;
+                    }
                     continue;
                 }
 
@@ -588,6 +607,7 @@ static unsigned __stdcall local_server_listener(void* param) {
                         client->webrtc_stream_ready = false;
                         client->cached_sps_len = 0;
                         client->cached_pps_len = 0;
+                        client->last_keyframe_request_tick = 0;
                         print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
 
                         // 启动视频转发线程

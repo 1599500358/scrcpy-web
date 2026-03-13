@@ -116,6 +116,14 @@ handle_control_message(struct sc_websocket_sink *ws, const char *message) {
         msg.inject_keycode.action = AKEY_EVENT_ACTION_UP;
         sc_controller_push_msg(ws->controller, &msg);
     }
+    else if (strcmp(action, "resetVideo") == 0 || strcmp(action, "requestKeyFrame") == 0) {
+        msg.type = SC_CONTROL_MSG_TYPE_RESET_VIDEO;
+        if (!sc_controller_push_msg(ws->controller, &msg)) {
+            LOGW("Could not request reset video");
+        } else {
+            LOGI("Requested encoder reset for keyframe");
+        }
+    }
     else if (strcmp(action, "touch") == 0) {
         // 触摸事件
         char *x_start = strstr(message, "\"x\":");
