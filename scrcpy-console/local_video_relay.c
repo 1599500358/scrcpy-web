@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef USE_WEBRTC
 #include "webrtc_support.h"
@@ -18,7 +19,8 @@
 #include <process.h>
 #include <wincrypt.h>
 
-#define LOCAL_VIDEO_PORT 27183
+// Avoid collision with scrcpy default adb tunnel local port range (27183-27199)
+#define LOCAL_VIDEO_PORT 37183
 #define MAX_LOCAL_CLIENTS 8
 #define VIDEO_BUFFER_SIZE (1024 * 1024)  // 1MB
 
@@ -29,6 +31,11 @@ typedef struct {
     char serial[256];
     bool active;
     bool first_frame_seen;
+    bool webrtc_stream_ready;
+    uint8_t cached_sps[1024];
+    int cached_sps_len;
+    uint8_t cached_pps[1024];
+    int cached_pps_len;
 } LocalScrcpyClient;
 
 static LocalScrcpyClient local_clients[MAX_LOCAL_CLIENTS];
@@ -78,6 +85,9 @@ static LocalScrcpyClient* create_local_client(const char* serial) {
             local_clients[i].control_socket = INVALID_SOCKET;
             local_clients[i].active = true;
             local_clients[i].first_frame_seen = false;
+            local_clients[i].webrtc_stream_ready = false;
+            local_clients[i].cached_sps_len = 0;
+            local_clients[i].cached_pps_len = 0;
             if (i >= local_client_count) {
                 local_client_count = i + 1;
             }
@@ -87,12 +97,24 @@ static LocalScrcpyClient* create_local_client(const char* serial) {
     return NULL;
 }
 
-// WebSocket 帧发送（服务器端不需要 mask）
+static bool socket_send_all(SOCKET sock, const uint8_t* data, int len) {
+    int sent_total = 0;
+    while (sent_total < len) {
+        int n = send(sock, (const char*)data + sent_total, len - sent_total, 0);
+        if (n <= 0) {
+            return false;
+        }
+        sent_total += n;
+    }
+    return true;
+}
+
+// WebSocket 文本帧发送（服务器端不需要 mask）
 static int ws_send_unmasked(SOCKET sock, const uint8_t* data, size_t len) {
     uint8_t header[10];
     int header_len = 2;
 
-    header[0] = 0x82; // FIN + binary frame
+    header[0] = 0x81; // FIN + text frame
 
     if (len < 126) {
         header[1] = (uint8_t)len;
@@ -109,11 +131,14 @@ static int ws_send_unmasked(SOCKET sock, const uint8_t* data, size_t len) {
         header_len = 10;
     }
 
-    if (send(sock, (char*)header, header_len, 0) < header_len) {
+    if (!socket_send_all(sock, header, header_len)) {
         return -1;
     }
 
-    return send(sock, (char*)data, (int)len, 0);
+    if (!socket_send_all(sock, data, (int)len)) {
+        return -1;
+    }
+    return (int)len;
 }
 
 static int recv_http_headers(SOCKET sock, char* request, int request_size) {
@@ -354,6 +379,65 @@ static int recv_ws_frame(SOCKET sock, uint8_t* buffer, int buffer_size) {
     return payload_len;
 }
 
+static int find_start_code(const uint8_t* data, int len, int from, int* sc_len_out) {
+    for (int i = from; i + 3 < len; i++) {
+        if (data[i] == 0x00 && data[i + 1] == 0x00) {
+            if (data[i + 2] == 0x01) {
+                *sc_len_out = 3;
+                return i;
+            }
+            if (i + 3 < len && data[i + 2] == 0x00 && data[i + 3] == 0x01) {
+                *sc_len_out = 4;
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+static void update_h264_cache(LocalScrcpyClient* client, const uint8_t* data, int len, bool* has_idr) {
+    *has_idr = false;
+    int pos = 0;
+
+    while (pos < len) {
+        int sc_len = 0;
+        int start = find_start_code(data, len, pos, &sc_len);
+        if (start < 0) {
+            break;
+        }
+
+        int nal_start = start + sc_len;
+        if (nal_start >= len) {
+            break;
+        }
+
+        int next_sc_len = 0;
+        int next_start = find_start_code(data, len, nal_start, &next_sc_len);
+        int nal_end = next_start >= 0 ? next_start : len;
+        if (nal_end <= nal_start) {
+            break;
+        }
+
+        uint8_t nal_type = data[nal_start] & 0x1F;
+        int unit_len_with_sc = nal_end - start;
+
+        if (nal_type == 7 && unit_len_with_sc <= (int)sizeof(client->cached_sps)) {
+            memcpy(client->cached_sps, data + start, unit_len_with_sc);
+            client->cached_sps_len = unit_len_with_sc;
+        } else if (nal_type == 8 && unit_len_with_sc <= (int)sizeof(client->cached_pps)) {
+            memcpy(client->cached_pps, data + start, unit_len_with_sc);
+            client->cached_pps_len = unit_len_with_sc;
+        } else if (nal_type == 5) {
+            *has_idr = true;
+        }
+
+        if (next_start < 0) {
+            break;
+        }
+        pos = next_start;
+    }
+}
+
 // 视频数据转发线程
 static unsigned __stdcall video_relay_thread(void* param) {
     LocalScrcpyClient* client = (LocalScrcpyClient*)param;
@@ -378,6 +462,9 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
         frame_count++;
 
+        bool has_idr = false;
+        update_h264_cache(client, video_buffer, len, &has_idr);
+
         if (!client->first_frame_seen) {
             client->first_frame_seen = true;
             if (g_video_connect_callback) {
@@ -392,6 +479,29 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
         WebRTCState state = webrtc_get_state(device_id);
         if (state == WEBRTC_STATE_CONNECTED) {
+            if (!client->webrtc_stream_ready) {
+                // 仅在拿到 SPS/PPS + IDR 后开始推流，确保浏览器端可立即起解码
+                if (!has_idr || client->cached_sps_len <= 0 || client->cached_pps_len <= 0) {
+                    drop_count++;
+                    continue;
+                }
+
+                bool init_ok = webrtc_send_video(device_id, client->cached_sps, client->cached_sps_len)
+                    && webrtc_send_video(device_id, client->cached_pps, client->cached_pps_len);
+                bool first_ok = init_ok && webrtc_send_video(device_id, video_buffer, len);
+                if (!first_ok) {
+                    drop_count++;
+                    if (drop_count < 5) {
+                        print_log("WARN", "[LocalRelay] WebRTC 初始化首帧发送失败: %s", client->serial);
+                    }
+                    continue;
+                }
+
+                client->webrtc_stream_ready = true;
+                print_log("INFO", "[LocalRelay] WebRTC 已发送 SPS/PPS+IDR，开始稳定推流: %s", client->serial);
+                continue;
+            }
+
             bool sent = webrtc_send_video(device_id, video_buffer, len);
             if (!sent) {
                 drop_count++;
@@ -400,6 +510,10 @@ static unsigned __stdcall video_relay_thread(void* param) {
                 }
             }
         } else {
+            if (client->webrtc_stream_ready) {
+                client->webrtc_stream_ready = false;
+                print_log("INFO", "[LocalRelay] WebRTC 连接变化，等待关键帧恢复: %s", client->serial);
+            }
             drop_count++;
             if (drop_count == 1 || drop_count % 100 == 0) {
                 print_log("WARN", "[LocalRelay] WebRTC 未连接 (state=%d), 丢帧: %d", state, drop_count);
@@ -471,6 +585,9 @@ static unsigned __stdcall local_server_listener(void* param) {
                         }
                         client->video_socket = client_sock;
                         client->first_frame_seen = false;
+                        client->webrtc_stream_ready = false;
+                        client->cached_sps_len = 0;
+                        client->cached_pps_len = 0;
                         print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
 
                         // 启动视频转发线程

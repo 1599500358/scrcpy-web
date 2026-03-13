@@ -887,19 +887,25 @@ function selectDevice(deviceId, evt) {
 }
 
 // 发送控制指令
+function isP2PControlReady() {
+    return useWebRTC && dataChannel && dataChannel.readyState === 'open';
+}
+
 function sendControl(action) {
     if (!currentDevice) {
         alert('请先选择一个设备');
         return;
     }
-    
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
+
+    if (isP2PControlReady()) {
+        dataChannel.send(JSON.stringify({
             type: 'control',
-            deviceId: currentDevice,
             action: action
         }));
+        return;
     }
+
+    console.warn('[CONTROL] P2P 通道未就绪，已丢弃控制指令:', action);
 }
 
 // 断开连接
@@ -971,6 +977,7 @@ function logout() {
 
 // Canvas 触摸事件处理
 let isTouching = false;
+let lastTouchDropLogTime = 0;
 
 function initTouchEvents() {
     if (!canvas) {
@@ -1057,17 +1064,23 @@ function getCanvasPosition(e) {
 }
 
 function sendTouchEvent(action, x, y) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
+    if (isP2PControlReady()) {
+        dataChannel.send(JSON.stringify({
             type: 'touch',
-            deviceId: currentDevice,
             action: action,
             x: x,
             y: y,
             width: canvas.width,
             height: canvas.height
         }));
-        console.log(`[TOUCH] 发送触摸: ${action} at (${x}, ${y})`);
+        return;
+    }
+
+    // 触摸 move 非常高频，避免刷屏，每 2 秒最多打印一次
+    const now = performance.now();
+    if (now - lastTouchDropLogTime > 2000) {
+        lastTouchDropLogTime = now;
+        console.warn('[TOUCH] P2P 通道未就绪，触摸事件已丢弃');
     }
 }
 

@@ -106,6 +106,7 @@ void load_device_names();
 #ifdef USE_WEBRTC
 void webrtc_send_signaling_message(const char* device_id, const char* message);
 void on_video_connected(const char* serial);
+void on_webrtc_data_message(const char* device_id, const uint8_t* data, size_t len);
 #endif
 void save_device_name(const char* serial, const char* custom_name);
 void base64_encode(const unsigned char* input, int length, char* output);
@@ -190,6 +191,8 @@ int main(int argc, char* argv[]) {
 
         // 设置视频连接回调
         set_video_connect_callback(on_video_connected);
+        // 设置 DataChannel 控制消息回调（浏览器 -> 控制台 -> scrcpy）
+        webrtc_set_data_message_callback(on_webrtc_data_message);
 
         // 初始化本地视频转发服务器
         if (init_local_video_relay()) {
@@ -521,6 +524,37 @@ void on_video_connected(const char* serial) {
         free(offer);
     } else {
         print_log("WARN", "[WebRTC] 创建 Offer 失败");
+    }
+}
+
+static bool extract_serial_from_device_id(const char* device_id, char* serial_out, size_t serial_out_size) {
+    if (!device_id || !serial_out || serial_out_size == 0) {
+        return false;
+    }
+
+    const char* sep = strchr(device_id, ':');
+    if (!sep || !sep[1]) {
+        return false;
+    }
+
+    strncpy(serial_out, sep + 1, serial_out_size - 1);
+    serial_out[serial_out_size - 1] = '\0';
+    return true;
+}
+
+void on_webrtc_data_message(const char* device_id, const uint8_t* data, size_t len) {
+    if (!device_id || !data || len == 0) {
+        return;
+    }
+
+    char serial[256];
+    if (!extract_serial_from_device_id(device_id, serial, sizeof(serial))) {
+        print_log("WARN", "[WebRTC] 无法从 device_id 解析 serial: %s", device_id ? device_id : "(null)");
+        return;
+    }
+
+    if (!send_control_to_scrcpy(serial, data, len)) {
+        print_log("WARN", "[WebRTC] P2P 控制消息转发失败: %s", serial);
     }
 }
 #endif
@@ -980,6 +1014,9 @@ void handle_server_message(const char* message) {
                     if (x_start && y_start && touchType_start) {
                         touchType_start += 13;
                         char* touchType_end = strchr(touchType_start, '"');
+                        if (!touchType_end) {
+                            return;
+                        }
                         
                         float x, y;
                         sscanf(x_start + 4, "%f", &x);
@@ -990,10 +1027,25 @@ void handle_server_message(const char* message) {
                         strncpy(touchType, touchType_start, touch_len);
                         touchType[touch_len] = '\0';
                         
-                        // TODO: 实现触摸事件（需要修改 scrcpy 或使用 ADB）
+                        // 优先走 scrcpy 控制通道（WebRTC 本地 relay 模式）
+#ifdef USE_WEBRTC
+                        if (send_control_to_scrcpy(serial, (const uint8_t*)message, strlen(message))) {
+                            print_log("DEBUG", "触摸指令已转发到 scrcpy: type=%s, x=%.2f, y=%.2f", touchType, x, y);
+                        } else {
+                            print_log("WARN", "触摸指令转发失败（控制通道不可用）: %s", serial);
+                        }
+#else
                         print_log("INFO", "  Touch: type=%s, x=%.2f, y=%.2f", touchType, x, y);
+#endif
                     }
                 } else {
+                    // 优先走 scrcpy 控制通道（低延迟）
+#ifdef USE_WEBRTC
+                    if (send_control_to_scrcpy(serial, (const uint8_t*)message, strlen(message))) {
+                        print_log("INFO", "控制指令已转发到 scrcpy: %s", action);
+                        return;
+                    }
+#endif
                     // 按键控制（home, back, etc.）
                     char adb_cmd[512];
                     const char* keycode = NULL;

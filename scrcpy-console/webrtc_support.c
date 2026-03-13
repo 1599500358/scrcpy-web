@@ -17,6 +17,9 @@
 #define MAX_DEVICES 32
 #define MAX_ICE_CANDIDATES 128
 #define SDP_BUFFER_SIZE 8192
+#define VIDEO_CHUNK_MAGIC 0xA5
+#define VIDEO_CHUNK_HEADER_SIZE 6
+#define VIDEO_CHUNK_PAYLOAD_MAX (60 * 1024)
 
 // 设备 WebRTC 连接信息
 typedef struct {
@@ -24,6 +27,7 @@ typedef struct {
     int pc;  // PeerConnection ID (libdatachannel)
     int dc;  // DataChannel ID
     WebRTCState state;
+    uint32_t next_frame_seq;
     char local_sdp[SDP_BUFFER_SIZE];
     char remote_sdp[SDP_BUFFER_SIZE];
     char ice_candidates[MAX_ICE_CANDIDATES][512];
@@ -37,6 +41,7 @@ static DeviceConnection g_connections[MAX_DEVICES] = {0};
 static int g_connection_count = 0;
 static WebRTCStateCallback g_state_callback = NULL;
 static WebRTCMessageCallback g_message_callback = NULL;
+static WebRTCDataMessageCallback g_data_message_callback = NULL;
 
 // 查找设备连接
 static DeviceConnection* find_connection(const char* device_id) {
@@ -60,6 +65,7 @@ static DeviceConnection* create_connection(const char* device_id) {
     conn->pc = -1;
     conn->dc = -1;
     conn->state = WEBRTC_STATE_DISCONNECTED;
+    conn->next_frame_seq = 1;
     g_connection_count++;
 
     return conn;
@@ -88,6 +94,19 @@ static void on_dc_closed(int dc, void* ptr) {
         if (g_state_callback) {
             g_state_callback(conn->device_id, WEBRTC_STATE_DISCONNECTED);
         }
+    }
+}
+
+// DataChannel 消息回调（接收来自 Web 客户端的控制消息）
+static void on_dc_message(int dc, const char* message, int size, void* ptr) {
+    (void)ptr;
+    DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(dc);
+    if (!conn || !message || size <= 0) {
+        return;
+    }
+
+    if (g_data_message_callback) {
+        g_data_message_callback(conn->device_id, (const uint8_t*)message, (size_t)size);
     }
 }
 
@@ -348,6 +367,7 @@ char* webrtc_create_offer(const char* device_id) {
     // 设置 DataChannel 回调
     rtcSetOpenCallback(conn->dc, on_dc_open);
     rtcSetClosedCallback(conn->dc, on_dc_closed);
+    rtcSetMessageCallback(conn->dc, on_dc_message);
 
     conn->state = WEBRTC_STATE_CONNECTING;
 
@@ -404,13 +424,51 @@ bool webrtc_add_ice_candidate(const char* device_id, const char* candidate) {
 bool webrtc_send_video(const char* device_id, const uint8_t* data, size_t len) {
 #ifdef USE_WEBRTC
     DeviceConnection* conn = find_connection(device_id);
-    if (!conn || conn->dc < 0 || conn->state != WEBRTC_STATE_CONNECTED) {
+    if (!conn || conn->dc < 0 || conn->state != WEBRTC_STATE_CONNECTED || !data || len == 0) {
         return false;
     }
 
-    // 发送二进制数据
-    int result = rtcSendMessage(conn->dc, (const char*)data, (int)len);
-    return result >= 0;
+    uint32_t frame_seq = conn->next_frame_seq++;
+    if (conn->next_frame_seq == 0) {
+        conn->next_frame_seq = 1;
+    }
+
+    uint8_t packet[VIDEO_CHUNK_HEADER_SIZE + VIDEO_CHUNK_PAYLOAD_MAX];
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk_len = len - offset;
+        if (chunk_len > VIDEO_CHUNK_PAYLOAD_MAX) {
+            chunk_len = VIDEO_CHUNK_PAYLOAD_MAX;
+        }
+
+        uint8_t flags = 0;
+        if (offset == 0) {
+            flags |= 0x01; // start
+        }
+        if (offset + chunk_len == len) {
+            flags |= 0x02; // end
+        }
+
+        packet[0] = VIDEO_CHUNK_MAGIC;
+        packet[1] = flags;
+        packet[2] = (uint8_t)(frame_seq & 0xFF);
+        packet[3] = (uint8_t)((frame_seq >> 8) & 0xFF);
+        packet[4] = (uint8_t)((frame_seq >> 16) & 0xFF);
+        packet[5] = (uint8_t)((frame_seq >> 24) & 0xFF);
+        memcpy(packet + VIDEO_CHUNK_HEADER_SIZE, data + offset, chunk_len);
+
+        int result = rtcSendMessage(conn->dc, (const char*)packet,
+                                    (int)(VIDEO_CHUNK_HEADER_SIZE + chunk_len));
+        if (result < 0) {
+            printf("[WebRTC] 发送视频分片失败: device=%s frame=%u offset=%zu chunk=%zu total=%zu\n",
+                   device_id, frame_seq, offset, chunk_len, len);
+            return false;
+        }
+
+        offset += chunk_len;
+    }
+
+    return true;
 #else
     return false;
 #endif
@@ -449,6 +507,10 @@ void webrtc_set_state_callback(WebRTCStateCallback callback) {
 
 void webrtc_set_message_callback(WebRTCMessageCallback callback) {
     g_message_callback = callback;
+}
+
+void webrtc_set_data_message_callback(WebRTCDataMessageCallback callback) {
+    g_data_message_callback = callback;
 }
 
 bool webrtc_is_available(void) {

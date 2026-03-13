@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +39,7 @@ typedef enum {
 // 回调函数类型
 typedef void (*WebRTCStateCallback)(const char* device_id, WebRTCState state);
 typedef void (*WebRTCMessageCallback)(const char* device_id, const char* message);
+typedef void (*WebRTCDataMessageCallback)(const char* device_id, const uint8_t* data, size_t len);
 
 // 初始化 WebRTC
 bool webrtc_init(const WebRTCConfig* config);
@@ -69,6 +71,9 @@ void webrtc_set_state_callback(WebRTCStateCallback callback);
 
 // 设置消息回调（用于发送信令消息）
 void webrtc_set_message_callback(WebRTCMessageCallback callback);
+
+// 设置 DataChannel 消息回调（用于接收来自浏览器的控制消息）
+void webrtc_set_data_message_callback(WebRTCDataMessageCallback callback);
 
 // 检查 WebRTC 是否可用
 bool webrtc_is_available(void);
