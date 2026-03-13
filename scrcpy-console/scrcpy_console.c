@@ -157,6 +157,17 @@ int main(int argc, char* argv[]) {
         strncpy(server_url, argv[1], sizeof(server_url) - 1);
     }
 
+    print_log("INFO", "服务器地址: %s", server_url);
+
+    // 初始化 Winsock（必须在任何网络操作之前）
+    if (!init_winsock()) {
+        print_log("ERROR", "Winsock 初始化失败");
+        free(ws_recv_buffer);
+        CoUninitialize();
+        DeleteCriticalSection(&thumbnail_cs);
+        return 1;
+    }
+
 #ifdef USE_WEBRTC
     // 初始化 WebRTC
     print_log("INFO", "初始化 WebRTC...");
@@ -187,18 +198,7 @@ int main(int argc, char* argv[]) {
         print_log("WARNING", "WebRTC 初始化失败，将使用 WebSocket 模式");
     }
 #endif
-    
-    print_log("INFO", "服务器地址: %s", server_url);
-    
-    // 初始化 Winsock
-    if (!init_winsock()) {
-        print_log("ERROR", "Winsock 初始化失败");
-        free(ws_recv_buffer);
-        CoUninitialize();
-        DeleteCriticalSection(&thumbnail_cs);
-        return 1;
-    }
-    
+
     // 预解析 ADB 路径
     resolve_adb_path();
     
