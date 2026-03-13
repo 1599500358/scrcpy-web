@@ -553,7 +553,17 @@ void on_webrtc_data_message(const char* device_id, const uint8_t* data, size_t l
         return;
     }
 
-    if (!send_control_to_scrcpy(serial, data, len)) {
+    if (send_control_to_scrcpy(serial, data, len)) {
+        size_t copy_len = len < 511 ? len : 511;
+        char preview[512];
+        memcpy(preview, data, copy_len);
+        preview[copy_len] = '\0';
+        if (strstr(preview, "\"action\":\"touch\"") &&
+            (strstr(preview, "\"touchType\":\"down\"") || strstr(preview, "\"touchType\":\"up\""))) {
+            print_log("DEBUG", "[WebRTC] P2P触摸消息已转发: %s", serial);
+        }
+        return;
+    } else {
         print_log("WARN", "[WebRTC] P2P 控制消息转发失败: %s", serial);
     }
 }

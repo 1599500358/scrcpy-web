@@ -1066,13 +1066,18 @@ function getCanvasPosition(e) {
 function sendTouchEvent(action, x, y) {
     if (isP2PControlReady()) {
         dataChannel.send(JSON.stringify({
-            type: 'touch',
-            action: action,
+            // 与 scrcpy websocket_sink 控制解析器保持一致
+            type: 'control',
+            action: 'touch',
+            touchType: action,
             x: x,
             y: y,
             width: canvas.width,
             height: canvas.height
         }));
+        if (action !== 'move') {
+            console.log(`[TOUCH][P2P] ${action} (${x}, ${y})`);
+        }
         return;
     }
 
