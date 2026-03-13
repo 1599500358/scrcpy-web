@@ -31,6 +31,7 @@ if [ "$OS" = "Darwin" ]; then
         exit 1
     fi
     CC="x86_64-w64-mingw32-gcc"
+    CXX="x86_64-w64-mingw32-g++"
 elif [ "$OS" = "Linux" ]; then
     # Linux
     if ! command -v x86_64-w64-mingw32-gcc &> /dev/null; then
@@ -39,6 +40,7 @@ elif [ "$OS" = "Linux" ]; then
         exit 1
     fi
     CC="x86_64-w64-mingw32-gcc"
+    CXX="x86_64-w64-mingw32-g++"
 else
     echo "错误: 不支持的操作系统 $OS"
     echo "此脚本仅支持 Linux 和 macOS 交叉编译 Windows 程序"
@@ -55,31 +57,40 @@ OUTPUT="scrcpy-console.exe"
 SOURCES="scrcpy_console.c"
 LIBS="-lws2_32 -lwindowscodecs -lole32 -loleaut32 -ladvapi32"
 CFLAGS="-O2 -Wall -Wextra -D_WIN32_WINNT=0x0600"
+LINKER="$CC"  # 默认使用 CC 进行链接
 
 # WebRTC 支持
 if [ $ENABLE_WEBRTC -eq 1 ]; then
     echo "启用 WebRTC 支持..."
     echo ""
 
-    # 检查 libdatachannel 库
-    if [ ! -f "libdatachannel/include/rtc/rtc.h" ]; then
-        echo "警告: 未找到 libdatachannel 库"
+    # 优先使用 vcpkg 安装的库
+    VCPKG_ROOT="$HOME/vcpkg"
+    VCPKG_INSTALLED="$VCPKG_ROOT/installed/x64-mingw-static"
+
+    if [ -f "$VCPKG_INSTALLED/include/rtc/rtc.h" ]; then
+        echo "使用 vcpkg 安装的 libdatachannel..."
+        SOURCES="$SOURCES webrtc_support.c"
+        LIBS="$LIBS -L$VCPKG_INSTALLED/lib -ldatachannel -ljuice -lusrsctp -lssl -lcrypto -lws2_32 -liphlpapi -lcrypt32 -lsecur32 -lbcrypt -lstdc++"
+        CFLAGS="$CFLAGS -DUSE_WEBRTC -I$VCPKG_INSTALLED/include"
+        # 使用 g++ 进行链接以支持 C++ 标准库
+        LINKER="$CXX"
+        echo "WebRTC 库已找到，开始编译..."
+    elif [ -f "libdatachannel/include/rtc/rtc.h" ]; then
+        echo "使用本地 libdatachannel..."
+        SOURCES="$SOURCES webrtc_support.c"
+        LIBS="$LIBS -Llibdatachannel/lib -ldatachannel -lssl -lcrypto -lz"
+        CFLAGS="$CFLAGS -DUSE_WEBRTC -Ilibdatachannel/include"
+        echo "WebRTC 库已找到，开始编译..."
+    else
+        echo "错误: 未找到 libdatachannel 库"
         echo ""
-        echo "请下载预编译包:"
-        echo "  https://github.com/paullouisageneau/libdatachannel/releases"
+        echo "请使用 vcpkg 安装:"
+        echo "  vcpkg install libdatachannel:x64-mingw-static"
         echo ""
-        echo "并解压到 libdatachannel 目录:"
-        echo "  scrcpy-console/libdatachannel/include/rtc/rtc.h"
-        echo "  scrcpy-console/libdatachannel/lib/libdatachannel.a"
-        echo ""
+        echo "或下载预编译包到 libdatachannel 目录"
         exit 1
     fi
-
-    SOURCES="$SOURCES webrtc_support.c"
-    LIBS="$LIBS -Llibdatachannel/lib -ldatachannel -lssl -lcrypto -lz"
-    CFLAGS="$CFLAGS -DUSE_WEBRTC -Ilibdatachannel/include"
-
-    echo "WebRTC 库已找到，开始编译..."
 else
     echo "编译标准版本（无 WebRTC）..."
 fi
@@ -90,7 +101,31 @@ echo "  输出: $OUTPUT"
 echo ""
 
 # 执行编译
-$CC $CFLAGS -o $OUTPUT $SOURCES $LIBS
+if [ $ENABLE_WEBRTC -eq 1 ]; then
+    # WebRTC 模式：先编译 C 代码为对象文件，再用 g++ 链接
+    echo "编译对象文件..."
+    for src in $SOURCES; do
+        obj="${src%.c}.o"
+        echo "  $src -> $obj"
+        $CC $CFLAGS -c -o $obj $src
+    done
+
+    # 获取所有对象文件
+    OBJECTS=""
+    for src in $SOURCES; do
+        obj="${src%.c}.o"
+        OBJECTS="$OBJECTS $obj"
+    done
+
+    echo "链接..."
+    $CXX -o $OUTPUT $OBJECTS $LIBS
+
+    # 清理对象文件
+    rm -f *.o
+else
+    # 标准模式：直接编译
+    $LINKER $CFLAGS -o $OUTPUT $SOURCES $LIBS
+fi
 
 if [ $? -eq 0 ]; then
     echo ""

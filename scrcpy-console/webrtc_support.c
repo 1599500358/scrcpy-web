@@ -175,7 +175,7 @@ bool webrtc_init(const WebRTCConfig* config) {
     }
 
     // 配置日志级别
-    rtcInitLogger(RTC_LOG_LEVEL_WARNING, NULL);
+    rtcInitLogger(RTC_LOG_WARNING, NULL);
 
     g_initialized = true;
     printf("[WebRTC] 初始化成功\n");
@@ -219,22 +219,32 @@ char* webrtc_create_offer(const char* device_id) {
     rtcConfiguration conf;
     memset(&conf, 0, sizeof(conf));
 
-    // 设置 STUN 服务器
-    char ice_servers[512];
+    // 设置 STUN/TURN 服务器 (使用静态数组)
+    static const char* ice_servers[4] = {NULL, NULL, NULL, NULL};
+    static char stun_url[256] = {0};
+    static char turn_url[512] = {0};
+
+    int server_count = 0;
+
+    // STUN 服务器
+    if (g_config.stun_server[0]) {
+        snprintf(stun_url, sizeof(stun_url), "stun:%s", g_config.stun_server);
+    } else {
+        strncpy(stun_url, "stun:stun.l.google.com:19302", sizeof(stun_url) - 1);
+    }
+    ice_servers[server_count++] = stun_url;
+
+    // TURN 服务器（如果配置了）
     if (g_config.turn_server[0] && g_config.turn_username[0]) {
-        snprintf(ice_servers, sizeof(ice_servers),
-            "stun:%s\n"  // STUN
-            "turn:%s %s %s",  // TURN
-            g_config.stun_server[0] ? g_config.stun_server : "stun.l.google.com:19302",
+        snprintf(turn_url, sizeof(turn_url), "turn:%s %s %s",
             g_config.turn_server,
             g_config.turn_username,
             g_config.turn_password);
-    } else {
-        snprintf(ice_servers, sizeof(ice_servers),
-            "stun:%s",
-            g_config.stun_server[0] ? g_config.stun_server : "stun.l.google.com:19302");
+        ice_servers[server_count++] = turn_url;
     }
+
     conf.iceServers = ice_servers;
+    conf.iceServersCount = server_count;
 
     // 创建 PeerConnection
     conn->pc = rtcCreatePeerConnection(&conf);
@@ -245,14 +255,11 @@ char* webrtc_create_offer(const char* device_id) {
 
     // 设置回调
     rtcSetLocalDescriptionCallback(conn->pc, on_local_description);
-    rtcSetIceCandidateCallback(conn->pc, on_ice_candidate);
+    rtcSetLocalCandidateCallback(conn->pc, on_ice_candidate);
     rtcSetStateChangeCallback(conn->pc, on_state_change);
 
-    // 创建 DataChannel
-    rtcDataChannelInit dcInit;
-    memset(&dcInit, 0, sizeof(dcInit));
-
-    conn->dc = rtcCreateDataChannel(conn->pc, "video", &dcInit);
+    // 创建 DataChannel (使用简化 API)
+    conn->dc = rtcCreateDataChannel(conn->pc, "video");
     if (conn->dc < 0) {
         printf("[WebRTC] 创建 DataChannel 失败\n");
         rtcClosePeerConnection(conn->pc);
@@ -340,7 +347,7 @@ void webrtc_close(const char* device_id) {
     }
 
     if (conn->dc >= 0) {
-        rtcCloseDataChannel(conn->dc);
+        rtcDeleteDataChannel(conn->dc);
         conn->dc = -1;
     }
 
