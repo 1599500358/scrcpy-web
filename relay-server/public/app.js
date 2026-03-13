@@ -182,10 +182,15 @@ function setupDataChannel(channel, deviceId) {
 
 // 处理 WebRTC Offer
 async function handleWebRTCOffer(deviceId, sdp, consoleId) {
-    console.log('[WebRTC] 收到 Offer, deviceId:', deviceId);
+    console.log('[WebRTC] 收到 Offer, deviceId:', deviceId, 'consoleId:', consoleId);
+    console.log('[WebRTC] 当前选择的设备:', currentDevice);
+    console.log('[WebRTC] SDP 类型:', sdp.type);
 
     if (!peerConnection) {
+        console.log('[WebRTC] peerConnection 不存在，创建新连接...');
         await createWebRTCConnection(deviceId);
+    } else {
+        console.log('[WebRTC] peerConnection 已存在');
     }
 
     if (!peerConnection) {
@@ -195,16 +200,19 @@ async function handleWebRTCOffer(deviceId, sdp, consoleId) {
 
     try {
         // 设置远程描述
+        console.log('[WebRTC] 设置远程描述...');
         await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
         console.log('[WebRTC] 已设置远程描述');
 
         // 发送缓存的 ICE candidates
+        console.log('[WebRTC] 添加缓存的 ICE candidates:', pendingCandidates.length);
         for (const candidate of pendingCandidates) {
             await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
         }
         pendingCandidates = [];
 
         // 创建 Answer
+        console.log('[WebRTC] 创建 Answer...');
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
         console.log('[WebRTC] 已创建 Answer');
@@ -215,6 +223,7 @@ async function handleWebRTCOffer(deviceId, sdp, consoleId) {
             deviceId: deviceId,
             sdp: answer
         }));
+        console.log('[WebRTC] Answer 已发送');
 
     } catch (e) {
         console.error('[WebRTC] 处理 Offer 失败:', e);
@@ -238,7 +247,7 @@ async function handleWebRTCIceCandidate(deviceId, candidate) {
 }
 
 // 关闭 WebRTC 连接
-function closeWebRTC() {
+function closeWebRTC(silent = false) {
     if (dataChannel) {
         dataChannel.close();
         dataChannel = null;
@@ -249,7 +258,9 @@ function closeWebRTC() {
     }
     useWebRTC = false;
     pendingCandidates = [];
-    console.log('[WebRTC] 连接已关闭');
+    if (!silent) {
+        console.log('[WebRTC] 连接已关闭');
+    }
 }
 
 // 初始化视频解码器
@@ -772,8 +783,8 @@ function selectDevice(deviceId, evt) {
     nalBuffer = [];
     waitingForKeyframe = false;
 
-    // 关闭之前的 WebRTC 连接
-    closeWebRTC();
+    // 关闭之前的 WebRTC 连接（静默模式，因为可能立即建立新连接）
+    closeWebRTC(true);
 
     // 更新 UI
     document.querySelectorAll('.device-item').forEach(item => {

@@ -220,12 +220,7 @@ int main(int argc, char* argv[]) {
         
         // 启动缩略图更新线程
         thumbnail_thread = (HANDLE)_beginthreadex(NULL, 0, thumbnail_update_thread, NULL, 0, NULL);
-        if (thumbnail_thread) {
-            print_log("INFO", "缩略图更新线程已启动");
-        } else {
-            print_log("WARNING", "无法启动缩略图更新线程");
-        }
-        
+
         // 进入主循环（会在连接断开时返回）
         console_loop();
         
@@ -698,11 +693,7 @@ void send_device_list() {
         json_escape_string(devices[i].serial, escaped_serial, sizeof(escaped_serial));
         json_escape_string(devices[i].model, escaped_model, sizeof(escaped_model));
         json_escape_string(devices[i].custom_name, escaped_name, sizeof(escaped_name));
-        
-        // 添加调试信息
-        print_log("DEBUG", "设备 %s 缩略图大小: %d 字符", devices[i].serial, 
-                   devices[i].thumbnail_base64 ? (int)strlen(devices[i].thumbnail_base64) : 0);
-        
+
         sprintf(message,
             "{\"type\":\"deviceUpdate\",\"device\":{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\",\"thumbnail\":\"%s\"}}",
             escaped_serial,
@@ -710,16 +701,14 @@ void send_device_list() {
             escaped_model,
             escaped_name,
             devices[i].thumbnail_base64 ? devices[i].thumbnail_base64 : "");
-        
+
         print_log("DEBUG", "发送设备信息: %s", message);
-        
+
         send_websocket_message(message);
         free(message);
-        
+
         print_log("INFO", "设备 %s 信息已发送到服务器", devices[i].serial);
     }
-    
-    print_log("INFO", "设备列表已发送到服务器（缩略图将在后台更新）");
 }
 
 void send_device_list_async() {
@@ -745,10 +734,8 @@ unsigned __stdcall thumbnail_update_thread(void* param) {
             thumbnail_update_pending = false;
         }
         LeaveCriticalSection(&thumbnail_cs);
-        
+
         if (should_update && device_count > 0) {
-            print_log("INFO", "开始更新设备缩略图");
-            
             // 限制并行线程数量，避免对系统造成过大压力
             const int MAX_CONCURRENT_THREADS = 8;  // 最多同时处理8个设备
             const int total_devices = device_count;
@@ -798,13 +785,11 @@ unsigned __stdcall thumbnail_update_thread(void* param) {
             EnterCriticalSection(&thumbnail_cs);
             last_thumbnail_update = GetTickCount();
             LeaveCriticalSection(&thumbnail_cs);
-            
+
             // 发送更新后的设备信息到服务器
             send_updated_device_list();
-            
-            print_log("INFO", "设备缩略图更新完成");
         }
-        
+
         // 短暂休眠，避免过度占用CPU
         Sleep(1000);
     }
@@ -1659,7 +1644,6 @@ void capture_device_screenshot(int device_index) {
                         fwrite(buffer, 1, bytesRead, fp);
                         fclose(fp);
                         write_success = TRUE;
-                        print_log("INFO", "设备 %s 缩略图文件已写入: %lu bytes", device->serial, bytesRead);
                     }
                 }
                 free(buffer);
@@ -1681,27 +1665,14 @@ void capture_device_screenshot(int device_index) {
     if (pFactory) pFactory->lpVtbl->Release(pFactory);
     
     if (FAILED(hr) || !write_success) {
-        print_log("WARNING", "设备 %s 缩略图保存失败: hr=0x%08X, write=%d", device->serial, hr, write_success);
         if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
-    
-    print_log("INFO", "设备 %s 缩略图已保存: %dx%d", device->serial, thumb_width, thumb_height);
-    
+
     // 读取缩略图文件
     FILE* fp = fopen(thumbnail_path, "rb");
     if (fp == NULL) {
-        print_log("WARNING", "设备 %s 缩略图读取失败: %s", device->serial, thumbnail_path);
-        
-        // 检查文件是否存在
-        DWORD attr = GetFileAttributesA(thumbnail_path);
-        if (attr == INVALID_FILE_ATTRIBUTES) {
-            print_log("WARNING", "缩略图文件不存在");
-        } else {
-            print_log("WARNING", "缩略图文件存在但无法打开");
-        }
-        
         if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
@@ -1714,7 +1685,6 @@ void capture_device_screenshot(int device_index) {
     
     // 限制最大 100KB
     if (thumb_size > 100 * 1024) {
-        print_log("WARNING", "设备 %s 缩略图太大: %ld bytes", device->serial, thumb_size);
         fclose(fp);
         if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
@@ -1749,13 +1719,6 @@ void capture_device_screenshot(int device_index) {
     // 清理临时文件
     DeleteFileA(screenshot_path);
     DeleteFileA(thumbnail_path);
-    
-    print_log("INFO", "设备 %s 缩略图已生成，大小: %ld bytes", device->serial, thumb_size);
-    
-    // 验证Base64编码是否成功
-    if (!device->thumbnail_base64 || strlen(device->thumbnail_base64) == 0) {
-        print_log("WARNING", "设备 %s Base64编码失败", device->serial);
-    }
 }
 
 void send_updated_device_list() {
@@ -1771,11 +1734,7 @@ void send_updated_device_list() {
         json_escape_string(devices[i].serial, escaped_serial, sizeof(escaped_serial));
         json_escape_string(devices[i].model, escaped_model, sizeof(escaped_model));
         json_escape_string(devices[i].custom_name, escaped_name, sizeof(escaped_name));
-        
-        // 添加调试信息
-        print_log("DEBUG", "设备 %s 缩略图大小: %d 字符", devices[i].serial, 
-                   devices[i].thumbnail_base64 ? (int)strlen(devices[i].thumbnail_base64) : 0);
-        
+
         sprintf(message,
             "{\"type\":\"deviceUpdate\",\"device\":{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\",\"thumbnail\":\"%s\"}}",
             escaped_serial,

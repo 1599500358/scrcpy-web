@@ -68,8 +68,8 @@ static DeviceConnection* create_connection(const char* device_id) {
 #ifdef USE_WEBRTC
 
 // DataChannel 打开回调
-static void on_dc_open(int pc, void* ptr) {
-    DeviceConnection* conn = (DeviceConnection*)ptr;
+static void on_dc_open(int dc, void* ptr) {
+    DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(dc);
     if (conn) {
         conn->state = WEBRTC_STATE_CONNECTED;
         printf("[WebRTC] DataChannel 已打开: %s\n", conn->device_id);
@@ -80,8 +80,8 @@ static void on_dc_open(int pc, void* ptr) {
 }
 
 // DataChannel 关闭回调
-static void on_dc_closed(int pc, void* ptr) {
-    DeviceConnection* conn = (DeviceConnection*)ptr;
+static void on_dc_closed(int dc, void* ptr) {
+    DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(dc);
     if (conn) {
         conn->state = WEBRTC_STATE_DISCONNECTED;
         printf("[WebRTC] DataChannel 已关闭: %s\n", conn->device_id);
@@ -93,8 +93,14 @@ static void on_dc_closed(int pc, void* ptr) {
 
 // PeerConnection 本地描述回调（生成 Offer 后触发）
 static void on_local_description(int pc, const char* sdp, const char* type, void* ptr) {
-    DeviceConnection* conn = (DeviceConnection*)ptr;
+    printf("[WebRTC] on_local_description 回调被触发\n");
+    printf("[WebRTC] SDP type: %s\n", type ? type : "NULL");
+
+    DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(pc);
+    printf("[WebRTC] UserPointer: %p\n", (void*)conn);
+
     if (conn && sdp) {
+        printf("[WebRTC] device_id: %s\n", conn->device_id);
         strncpy(conn->local_sdp, sdp, SDP_BUFFER_SIZE - 1);
 
         // 转义 SDP 字符串中的特殊字符（换行符等）
@@ -131,6 +137,8 @@ static void on_local_description(int pc, const char* sdp, const char* type, void
         }
         *dst = '\0';
 
+        printf("[WebRTC] SDP 长度: %zu, 转义后长度: %zu\n", strlen(sdp), strlen(escaped_sdp));
+
         // 构造 JSON 格式的 Offer 消息
         char message[SDP_BUFFER_SIZE * 2 + 512];
         snprintf(message, sizeof(message),
@@ -140,18 +148,28 @@ static void on_local_description(int pc, const char* sdp, const char* type, void
         free(escaped_sdp);
 
         // 发送 Offer 到信令服务器
+        printf("[WebRTC] 调用消息回调发送 Offer...\n");
         if (g_message_callback) {
             g_message_callback(conn->device_id, message);
+            printf("[WebRTC] Offer 已通过回调发送\n");
+        } else {
+            printf("[WebRTC] 错误: 消息回调未设置!\n");
         }
 
         printf("[WebRTC] 已生成本地描述 (Offer)\n");
+    } else {
+        printf("[WebRTC] 错误: conn=%p, sdp=%p\n", (void*)conn, (void*)sdp);
     }
 }
 
 // ICE Candidate 回调
 static void on_ice_candidate(int pc, const char* candidate, const char* mid, void* ptr) {
-    DeviceConnection* conn = (DeviceConnection*)ptr;
+    printf("[WebRTC] on_ice_candidate 回调被触发\n");
+
+    DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(pc);
     if (conn && candidate) {
+        printf("[WebRTC] ICE candidate for device: %s\n", conn->device_id);
+
         // 缓存 ICE candidate
         if (conn->ice_count < MAX_ICE_CANDIDATES) {
             strncpy(conn->ice_candidates[conn->ice_count], candidate, 511);
@@ -183,13 +201,14 @@ static void on_ice_candidate(int pc, const char* candidate, const char* mid, voi
         // 发送 ICE candidate 到信令服务器
         if (g_message_callback) {
             g_message_callback(conn->device_id, message);
+            printf("[WebRTC] ICE candidate 已发送\n");
         }
     }
 }
 
 // PeerConnection 状态改变回调
 static void on_state_change(int pc, rtcState state, void* ptr) {
-    DeviceConnection* conn = (DeviceConnection*)ptr;
+    DeviceConnection* conn = (DeviceConnection*)rtcGetUserPointer(pc);
     if (conn) {
         switch (state) {
             case RTC_CONNECTING:
@@ -305,6 +324,10 @@ char* webrtc_create_offer(const char* device_id) {
         return NULL;
     }
 
+    // 设置 User Pointer，让回调能获取到连接信息
+    // 必须在设置回调和创建 DataChannel 之前设置
+    rtcSetUserPointer(conn->pc, conn);
+
     // 设置回调
     rtcSetLocalDescriptionCallback(conn->pc, on_local_description);
     rtcSetLocalCandidateCallback(conn->pc, on_ice_candidate);
@@ -319,20 +342,22 @@ char* webrtc_create_offer(const char* device_id) {
         return NULL;
     }
 
+    // 设置 DataChannel 的 User Pointer
+    rtcSetUserPointer(conn->dc, conn);
+
     // 设置 DataChannel 回调
     rtcSetOpenCallback(conn->dc, on_dc_open);
     rtcSetClosedCallback(conn->dc, on_dc_closed);
 
     conn->state = WEBRTC_STATE_CONNECTING;
 
-    // 触发本地描述生成（这会调用 on_local_description 回调）
-    // 注意：在 libdatachannel 中，设置 local description 会自动触发
-    char sdp[SDP_BUFFER_SIZE];
-    rtcGetLocalDescription(conn->pc, sdp, SDP_BUFFER_SIZE);
+    // libdatachannel 会自动生成 SDP 并调用 on_local_description 回调
+    // 不需要手动调用 rtcGetLocalDescription
 
-    // 返回 SDP（调用者需要释放）
-    char* result = strdup(sdp);
-    return result;
+    printf("[WebRTC] PeerConnection 和 DataChannel 已创建，等待 SDP 生成...\n");
+
+    // 返回 device_id 副本，表示创建成功
+    return strdup(conn->device_id);
 #else
     return NULL;
 #endif

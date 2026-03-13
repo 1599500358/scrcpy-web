@@ -63,9 +63,13 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
 
     // 查找正在观看该设备的 Web 客户端
     let targetWebClient = null;
+    console.log(`[WebRTC] 查找 Web 客户端，当前 webClients 数量: ${webClients.size}`);
+
     webClients.forEach((client, clientId) => {
+        console.log(`[WebRTC] 检查 Web 客户端 ${clientId}, currentDevice: ${client.currentDevice}, 目标: ${deviceId}`);
         if (client.currentDevice === deviceId) {
             targetWebClient = { ws: client.ws, clientId };
+            console.log(`[WebRTC] 找到匹配的 Web 客户端 ${clientId}`);
         }
     });
 
