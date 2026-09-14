@@ -206,7 +206,7 @@
             </button>
         </form>
 
-        <div class="divider">或</div>
+        <div class="divider" id="password-divider">或</div>
 
         <button type="button" class="google-button" id="google-login-button">
             <svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
@@ -261,8 +261,9 @@
             }
         });
 
-        // 回车键提交表单
+        // 回车键提交表单（仅密码登录模式）
         document.addEventListener('keypress', (e) => {
+            if (document.getElementById('login-form').style.display === 'none') return;
             if (e.key === 'Enter' && !document.getElementById('login-button').disabled) {
                 document.getElementById('login-form').dispatchEvent(new Event('submit'));
             }
@@ -279,12 +280,22 @@
             }
         })();
 
-        // Google 登录：仅在服务端已配置 OAuth 凭据时展示按钮
+        // Google 登录：仅在服务端已配置 OAuth 凭据时展示按钮；
+        // passwordLogin=false 时进入"仅 Google 登录"模式，隐藏账号密码表单
         (function initGoogleLogin() {
             const googleButton = document.getElementById('google-login-button');
+            const errorMessage = document.getElementById('error-message');
             fetch('/api/auth/google/status')
                 .then((r) => r.json())
                 .then((status) => {
+                    if (status && status.passwordLogin === false) {
+                        document.getElementById('login-form').style.display = 'none';
+                        document.getElementById('password-divider').style.display = 'none';
+                        if (!status.enabled) {
+                            errorMessage.textContent = '当前仅支持 Google 登录，但服务端未配置 Google OAuth';
+                            errorMessage.style.display = 'block';
+                        }
+                    }
                     if (status && status.enabled) {
                         googleButton.style.display = 'flex';
                         googleButton.addEventListener('click', () => {

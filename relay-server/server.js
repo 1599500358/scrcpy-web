@@ -126,6 +126,8 @@ function requestDeviceKeyframe(device, serial, forceReset = false) {
 const HTTP_PORT = process.env.HTTP_PORT || 8080;  // 本地 scrcpy 使用
 const HTTPS_PORT = process.env.HTTPS_PORT || 8443; // 远程 Web 使用
 const ENABLE_HTTPS = process.env.ENABLE_HTTPS === 'true' || false;
+// 账号密码登录开关：设置 PASSWORD_LOGIN=false 时仅允许 Google 登录
+const PASSWORD_LOGIN = (process.env.PASSWORD_LOGIN || 'true') !== 'false';
 
 // 创建 HTTP 服务器（总是启用）
 // 如果启用了 HTTPS，HTTP 端口只做两件事：1. WebSocket 连接 2. 其他请求重定向到 HTTPS
@@ -320,6 +322,10 @@ app.get('/login', (req, res) => {
 
 // 登录API
 app.post('/api/login', async (req, res) => {
+    if (!PASSWORD_LOGIN) {
+        return res.status(403).json({ success: false, message: '密码登录已禁用，请使用 Google 登录' });
+    }
+
     const { username, password } = req.body;
     
     if (!username || !password) {
@@ -378,7 +384,7 @@ function deriveGoogleRedirectUri(req) {
 
 // 登录页查询 Google 登录是否可用（决定是否展示按钮）
 app.get('/api/auth/google/status', (req, res) => {
-    res.json({ enabled: googleAuth.isGoogleOAuthConfigured() });
+    res.json({ enabled: googleAuth.isGoogleOAuthConfigured(), passwordLogin: PASSWORD_LOGIN });
 });
 
 // 发起 Google 登录：生成 state + PKCE 暂存到会话后跳转 Google
