@@ -8,3 +8,16 @@ build/
 /x/
 local.properties
 /scrcpy-server
+
+# 本地敏感配置与私有数据(禁止入库)
+relay-server/auth-config.json
+relay-server/device_aliases.json
+relay-server/cert/
+relay-server/logs/
+relay-server/*.zip
+scrcpy-console/*.log
+scrcpy-console/screenshot_*
+.DS_Store
+
+/relay-server.zip
+scrcpy-console/*.exe

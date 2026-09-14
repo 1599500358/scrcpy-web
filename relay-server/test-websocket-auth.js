@@ -4,7 +4,7 @@ const http = require('http');
 // First, let's get a session cookie by logging in
 const loginData = JSON.stringify({
     username: 'admin',
-    password: 'password'  // This is the correct password based on our test
+    password: process.env.TEST_PASSWORD || 'test-password'
 });
 
 const loginOptions = {

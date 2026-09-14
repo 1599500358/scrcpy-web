@@ -32,7 +32,7 @@ setTimeout(() => {
   console.log('\n=== Testing login ===');
   const loginData = JSON.stringify({
     username: 'admin',
-    password: 'password'
+    password: process.env.TEST_PASSWORD || 'test-password'
   });
 
   const loginOptions = {
