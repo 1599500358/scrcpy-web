@@ -14,6 +14,8 @@ const crypto = require('crypto');
 const GOOGLE_AUTH_URL = process.env.GOOGLE_AUTH_URL || 'https://accounts.google.com/o/oauth2/auth';
 const GOOGLE_TOKEN_URL = process.env.GOOGLE_TOKEN_URL || 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO_URL = process.env.GOOGLE_USERINFO_URL || 'https://www.googleapis.com/oauth2/v2/userinfo';
+// 走中继（覆盖 GOOGLE_*_URL）时必带的共享密钥，见 photo 项目的 scrcpy-auth-relay 端点
+const SCRCPY_RELAY_KEY = process.env.SCRCPY_RELAY_KEY || '';
 
 /**
  * 解析 Google OAuth 配置。密钥与白名单绝不给默认值：
@@ -77,19 +79,24 @@ function timingSafeEqualStr(a, b) {
 }
 
 async function exchangeGoogleCode(params) {
-    const body = new URLSearchParams({
+    const tokenParams = {
         code: params.code,
         client_id: params.clientId,
         client_secret: params.clientSecret,
         redirect_uri: params.redirectUri,
         grant_type: 'authorization_code',
         code_verifier: params.codeVerifier
-    });
+    };
+    // 覆盖 GOOGLE_TOKEN_URL（中继模式）时以 JSON 提交以穿透 Astro CSRF，
+    // worker 端会转回 form-urlencoded 再请求 Google；直连 Google 时保持官方表单格式
+    const usingRelay = !!process.env.GOOGLE_TOKEN_URL;
 
     const res = await fetch(GOOGLE_TOKEN_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString()
+        headers: usingRelay
+            ? { 'Content-Type': 'application/json', 'X-Relay-Key': SCRCPY_RELAY_KEY }
+            : { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: usingRelay ? JSON.stringify(tokenParams) : new URLSearchParams(tokenParams).toString()
     });
 
     if (!res.ok) {
@@ -104,7 +111,10 @@ async function exchangeGoogleCode(params) {
 
 async function getGoogleUserInfo(accessToken) {
     const res = await fetch(GOOGLE_USERINFO_URL, {
-        headers: { Authorization: `Bearer ${accessToken}` }
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            ...(SCRCPY_RELAY_KEY && { 'X-Relay-Key': SCRCPY_RELAY_KEY })
+        }
     });
 
     if (!res.ok) {
