@@ -331,6 +331,9 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
             case ControlMessage.TYPE_RESET_VIDEO:
                 resetVideo();
                 break;
+            case ControlMessage.TYPE_REQUEST_SYNC_FRAME:
+                requestSyncFrame();
+                break;
             default:
                 // do nothing
         }
@@ -752,6 +755,16 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
         if (surfaceCapture != null) {
             Ln.i("Video capture reset");
             surfaceCapture.requestInvalidate();
+        }
+    }
+
+    private void requestSyncFrame() {
+        if (surfaceCapture != null) {
+            boolean accepted = surfaceCapture.requestSyncFrame();
+            if (!accepted) {
+                // 编码器未运行或不支持（旧设备），调用方可依赖 IDR 观察超时后回退 RESET_VIDEO
+                Ln.d("Sync frame request not delivered (encoder not running)");
+            }
         }
     }
 }

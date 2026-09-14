@@ -16,6 +16,9 @@
 #ifdef USE_WEBRTC
 #include "webrtc_support.h"
 #include "local_video_relay.h"
+#else
+// 非 WebRTC 构建同样需要 local_video_relay.h 的声明（对应实现为空桩）
+#include "local_video_relay.h"
 #endif
 
 // WIC 接口 GUID 声明（使用 extern 避免重复定义）
@@ -42,6 +45,72 @@ static WebRTCConfig g_webrtc_config = {0};
 static volatile LONG g_video_connect_version = 0;
 static char g_last_video_connected_serial[256] = {0};
 #endif
+
+// 画质档位白名单：浏览器传入的 profile 仅作索引，命令行参数固定，不接收任意字符串。
+// 参数为试验起点（方案 doc/latency-optimization-plan.md 第6节），码率用于估算发送水位预算
+typedef struct {
+    const char* name;               // 档位标识
+    const char* args;               // 固定参数（白名单内）；空串表示不主动限制
+    unsigned target_bitrate_bps;    // 目标码率（bps），用于发送水位预算
+} VideoProfile;
+
+void print_log(const char* level, const char* format, ...);
+
+static const VideoProfile VIDEO_PROFILES[] = {
+    { "original",    "",                                                     8000000u },
+    { "interactive", "--max-size=1280 --video-bit-rate=4M --max-fps=60",     4000000u },
+    { "weaknet",     "--max-size=1024 --video-bit-rate=2M --max-fps=30",     2000000u },
+    { "sharp",       "--max-size=1920 --video-bit-rate=6M --max-fps=60",     6000000u },
+};
+
+static const VideoProfile* find_video_profile(const char* name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(VIDEO_PROFILES) / sizeof(VIDEO_PROFILES[0]); i++) {
+        if (strcmp(VIDEO_PROFILES[i].name, name) == 0) {
+            return &VIDEO_PROFILES[i];
+        }
+    }
+    return NULL;
+}
+
+// 从 startDevice 消息解析档位；VIDEO_PROFILE 环境变量可强制锁定（试验/回退开关）；
+// 未指定或非法时回退 original（与历史行为一致）
+static VideoProfile resolve_video_profile_from_message(const char* message) {
+    char requested[32] = {0};
+    const char* p = strstr(message, "\"profile\":\"");
+    if (p) {
+        p += strlen("\"profile\":\"");
+        const char* end = strchr(p, '"');
+        if (end && (end - p) < (int)sizeof(requested) - 1) {
+            size_t len = (size_t)(end - p);
+            memcpy(requested, p, len);
+            requested[len] = '\0';
+        }
+    }
+
+    const VideoProfile* result = NULL;
+    const char* forced = getenv("VIDEO_PROFILE");
+    if (forced && forced[0]) {
+        result = find_video_profile(forced);
+        if (result) {
+            print_log("INFO", "画质档位由 VIDEO_PROFILE 环境变量锁定: %s", forced);
+        } else {
+            print_log("WARN", "VIDEO_PROFILE 环境变量无效: %s，忽略", forced);
+        }
+    }
+    if (!result && requested[0]) {
+        result = find_video_profile(requested);
+        if (!result) {
+            print_log("WARN", "未知画质档位: %s，使用原有配置", requested);
+        }
+    }
+    if (!result) {
+        result = &VIDEO_PROFILES[0];
+    }
+    return *result;
+}
 
 // 线程参数结构
 typedef struct {
@@ -1335,8 +1404,19 @@ void handle_server_message(const char* message) {
                 target_server = server_url;
 #endif
 
+                // 解析画质档位（白名单），并按码率设置 WebRTC 发送水位预算
+                VideoProfile profile = resolve_video_profile_from_message(message);
+                print_log("INFO", "画质档位: %s (目标码率 %u bps)%s%s", profile.name, profile.target_bitrate_bps,
+                          profile.args[0] ? " " : "", profile.args[0] ? profile.args : "(不主动限制)");
+#ifdef USE_WEBRTC
+                if (g_webrtc_enabled) {
+                    // 预算 = 码率 × 100ms 排队 / 8，例如 4Mbps ≈ 50KB；水位超限触发关键帧恢复
+                    webrtc_set_send_budget(profile.target_bitrate_bps / 8 / 10);
+                }
+#endif
+
                 // 构建 scrcpy 命令 - 使用多级回退策略
-                // 1) baseline profile
+                // 1) 所选画质档位参数
                 // 2) 默认编码参数 + 降分辨率
                 // 3) 指定软件编码器 OMX.google.h264.encoder + 降分辨率
                 // WebRTC 模式下，如果本地 target 失败，还会对 relay-server 再做一组回退尝试
@@ -1344,10 +1424,17 @@ void handle_server_message(const char* message) {
                 bool use_local_relay[12];
                 int attempt_count = 0;
 
-                snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
-                    ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
-                    serial, target_server);
-                use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
+                if (profile.args[0]) {
+                    snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio %s --video-codec-options profile:int=1",
+                        serial, target_server, profile.args);
+                    use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
+                } else {
+                    snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
+                        ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --video-codec-options profile:int=1",
+                        serial, target_server);
+                    use_local_relay[attempt_count - 1] = (strcmp(target_server, server_url) != 0);
+                }
                 snprintf(start_cmds[attempt_count++], sizeof(start_cmds[0]),
                     ".\\scrcpy.exe -s %s --websocket-server=%s --no-video-playback --no-audio --max-size=1024",
                     serial, target_server);
@@ -1396,7 +1483,9 @@ void handle_server_message(const char* message) {
                 for (int i = 0; i < attempt_count; i++) {
                     ZeroMemory(&pi, sizeof(pi));
                     final_cmd = start_cmds[i];
+#ifdef USE_WEBRTC
                     LONG version_before_launch = g_video_connect_version;
+#endif
 
 #ifdef USE_WEBRTC
                     if (g_webrtc_enabled && use_local_relay[i]) {
@@ -1500,11 +1589,12 @@ void handle_server_message(const char* message) {
                     print_log("SUCCESS", "已启动设备 %s 的镜像，进程 ID: %lu", serial, devices[device_index].process_id);
                     print_log("INFO", "最终使用命令: %s", final_cmd ? final_cmd : "(unknown)");
 
-                    // 通知服务器已开始推流
-                    char notify_msg[512];
+                    // 通知服务器已开始推流（携带实际生效的档位与参数，供前端展示）
+                    char notify_msg[1024];
                     snprintf(notify_msg, sizeof(notify_msg),
-                        "{\"type\":\"startStreaming\",\"serial\":\"%s\"}",
-                        serial);
+                        "{\"type\":\"startStreaming\",\"serial\":\"%s\",\"profile\":\"%s\",\"args\":\"%s\",\"keyframeMode\":\"%s\"}",
+                        serial, profile.name, profile.args,
+                        local_relay_sync_keyframe_enabled() ? "sync" : "reset");
                     send_websocket_message(notify_msg);
                 } else {
                     if (last_exit_code != 0) {
@@ -1554,11 +1644,11 @@ void handle_server_message(const char* message) {
                 serial[len] = '\0';
                 
                 print_log("INFO", "Web客户端请求设备 %s 的关键帧", serial);
-                
-                static const char* reset_msg = "{\"type\":\"control\",\"action\":\"resetVideo\"}";
+
 #ifdef USE_WEBRTC
-                if (send_control_to_scrcpy(serial, (const uint8_t*)reset_msg, strlen(reset_msg))) {
-                    print_log("INFO", "已向scrcpy进程转发关键帧请求: %s", serial);
+                if (request_device_keyframe(serial)) {
+                    print_log("INFO", "已向scrcpy进程转发关键帧请求(%s): %s",
+                              local_relay_sync_keyframe_enabled() ? "syncFrame" : "resetVideo", serial);
                 } else {
                     print_log("WARN", "关键帧请求转发失败（控制通道不可用）: %s", serial);
                 }

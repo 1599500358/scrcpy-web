@@ -10,6 +10,7 @@ let ctx = null;
 let videoDecoder = null;
 let isDecoderReady = false;
 let waitingForKeyframe = false;
+let lastDecoderConfig = null; // 最近一次成功的解码器配置（过载恢复时重新 configure 用）
 
 // H.264 流缓冲
 let nalBuffer = [];
@@ -19,6 +20,45 @@ let frameCount = 0;
 let lastFrameTime = 0;
 let lastStatsTime = 0;
 let bytesReceived = 0;
+
+// ========== 链路诊断（方案 4.1 可观测性） ==========
+const diag = {
+    connectionType: '-',      // WebRTC 直连 / WebRTC TURN / WebSocket 中继
+    iceRtt: null,             // 选中 candidate pair 的 currentRoundTripTime
+    localCandidateType: '-',
+    remoteCandidateType: '-',
+    selectedProtocol: '-',
+    decodeQueueSize: 0,       // 最近一次采样的解码队列长度
+    decodeQueueSamples: [],   // 最近 N 秒的队列采样
+    consoleBuffered: null,    // 控制台 DataChannel 发送水位（字节）
+    consoleFramesSent: null,
+    consoleFramesDropped: null,
+    firstFrameMs: null,       // 选择设备到首帧绘制的耗时
+    drawMs: null,             // 最近一次 drawImage 耗时
+    fps: 0,
+    kbpsIn: 0,
+    profile: '-',             // 实际生效画质档位
+    profileArgs: '',
+    keyframeMode: '-',
+};
+let currentEpoch = 0;         // 每次切换设备/重建连接递增，用于拒绝旧流回调
+let pendingFirstFrameStart = 0;
+let keyframeFallbackTimer = null;
+let decoderReconfigFallbackTimer = null;
+let decoderOverloadSamples = 0;
+let lastKeyframeRequestAt = 0;
+
+// 画质档位定义（与控制台白名单一致）
+const VIDEO_PROFILES = [
+    { id: 'interactive', label: '交互优先 (1280/4M/60fps)' },
+    { id: 'sharp', label: '清晰优先 (1920/6M/60fps)' },
+    { id: 'weaknet', label: '弱网 (1024/2M/30fps)' },
+    { id: 'original', label: '原有配置 (不限尺寸/8M)' },
+];
+let selectedProfile = localStorage.getItem('videoProfile');
+if (!VIDEO_PROFILES.some(p => p.id === selectedProfile)) {
+    selectedProfile = 'interactive';
+}
 
 // ========== WebRTC 相关 ==========
 let peerConnection = null;
@@ -158,9 +198,78 @@ window.onload = async function() {
     // 初始化触摸事件
     initTouchEvents();
     initMobileUI();
+    initVideoProfileSelector();
 
     console.log('[INIT] 初始化完成, WebRTC:', webrtcEnabled ? '启用' : '禁用');
 };
+
+// ========== 画质档位选择（切换需重启视频，控制台白名单校验） ==========
+function initVideoProfileSelector() {
+    const select = document.getElementById('videoProfileSelect');
+    if (!select) {
+        return;
+    }
+
+    VIDEO_PROFILES.forEach((p) => {
+        const option = document.createElement('option');
+        option.value = p.id;
+        option.textContent = p.label;
+        select.appendChild(option);
+    });
+    select.value = selectedProfile;
+    diag.profile = selectedProfile;
+
+    select.onchange = () => {
+        const newProfile = select.value;
+        if (newProfile === selectedProfile) {
+            return;
+        }
+        const previous = selectedProfile;
+        selectedProfile = newProfile;
+        localStorage.setItem('videoProfile', newProfile);
+
+        if (!currentDevice) {
+            diag.profile = newProfile;
+            return;
+        }
+        if (!confirm('切换画质需要重启视频推流（画面会短暂中断），是否继续？')) {
+            selectedProfile = previous;
+            select.value = previous;
+            return;
+        }
+        restartCurrentDeviceWithProfile();
+    };
+}
+
+// 切换画质需要重启视频：停止当前推流，随后按新档位重新选择设备。
+// 切换期间画面会中断，不做无缝切换伪装
+function restartCurrentDeviceWithProfile() {
+    const deviceId = currentDevice;
+    console.log(`[DEVICE] 按档位 ${selectedProfile} 重启推流: ${deviceId}`);
+
+    clearDecoderRecoveryTimers();
+    currentEpoch++;
+    closeWebRTC(true);
+    resetWebRTCAssembler();
+    if (videoDecoder && videoDecoder.state !== 'unconfigured') {
+        videoDecoder.reset();
+    }
+    nalBuffer = [];
+    waitingForKeyframe = false;
+    lastDecoderConfig = null;
+    diag.profile = selectedProfile;
+    diag.profileArgs = '';
+    document.getElementById('loading').style.display = 'flex';
+
+    ws.send(JSON.stringify({ type: 'stopDevice', deviceId }));
+    currentDevice = null;
+
+    setTimeout(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            selectDevice(deviceId);
+        }
+    }, 1000);
+}
 
 // ========== WebRTC 函数 ==========
 
@@ -196,6 +305,7 @@ async function createWebRTCConnection(deviceId) {
     }
 
     console.log('[WebRTC] 创建 PeerConnection...');
+    const myEpoch = currentEpoch;
 
     try {
         peerConnection = new RTCPeerConnection(rtcConfig);
@@ -204,7 +314,7 @@ async function createWebRTCConnection(deviceId) {
         peerConnection.ondatachannel = (event) => {
             console.log('[WebRTC] 收到 DataChannel:', event.channel.label);
             dataChannel = event.channel;
-            setupDataChannel(dataChannel, deviceId);
+            setupDataChannel(dataChannel, deviceId, myEpoch);
         };
 
         // 监听 ICE Candidate
@@ -226,7 +336,8 @@ async function createWebRTCConnection(deviceId) {
             console.log('[WebRTC] 连接状态:', state);
 
             if (state === 'connected') {
-                console.log('[WebRTC] ✅ P2P 连接成功');
+                // 连接建立不区分直连/TURN，实际路径由 getStats 采样的诊断面板显示
+                console.log('[WebRTC] ✅ 连接建立（直连/TURN 由诊断面板显示）');
                 useWebRTC = true;
                 ws.send(JSON.stringify({
                     type: 'webrtc-connected',
@@ -259,11 +370,16 @@ async function createWebRTCConnection(deviceId) {
 }
 
 // 设置 DataChannel
-function setupDataChannel(channel, deviceId) {
+function setupDataChannel(channel, deviceId, myEpoch) {
     channel.binaryType = 'arraybuffer';
 
     channel.onopen = () => {
         console.log('[WebRTC] DataChannel 已打开');
+        if (myEpoch !== undefined && myEpoch !== currentEpoch) {
+            console.log('[WebRTC] 忽略旧 epoch 的 DataChannel 打开事件');
+            try { channel.close(); } catch (e) { /* ignore */ }
+            return;
+        }
         useWebRTC = true;
 
         // 隐藏加载提示
@@ -281,6 +397,13 @@ function setupDataChannel(channel, deviceId) {
     };
 
     channel.onmessage = (event) => {
+        if (myEpoch !== undefined && myEpoch !== currentEpoch) {
+            return; // 旧 epoch 残留数据，直接丢弃
+        }
+        if (typeof event.data === 'string') {
+            handleConsoleMetrics(event.data);
+            return;
+        }
         if (event.data instanceof ArrayBuffer) {
             // 更新统计
             bytesReceived += event.data.byteLength;
@@ -289,6 +412,21 @@ function setupDataChannel(channel, deviceId) {
             handleIncomingVideoData(new Uint8Array(event.data));
         }
     };
+}
+
+// 处理控制台侧指标上报（诊断面板数据源）
+function handleConsoleMetrics(text) {
+    try {
+        const msg = JSON.parse(text);
+        if (msg.type !== 'consoleMetrics') {
+            return;
+        }
+        diag.consoleBuffered = typeof msg.bufferedAmount === 'number' ? msg.bufferedAmount : null;
+        diag.consoleFramesSent = typeof msg.framesSent === 'number' ? msg.framesSent : null;
+        diag.consoleFramesDropped = typeof msg.framesDropped === 'number' ? msg.framesDropped : null;
+    } catch (e) {
+        // 非指标文本消息，忽略
+    }
 }
 
 function handleIncomingVideoData(buffer) {
@@ -434,6 +572,206 @@ function resetWebRTCAssembler() {
     assemblingSize = 0;
 }
 
+// ========== 链路诊断与过载恢复 ==========
+
+// 通过 getStats 识别实际连接路径（直连/TURN）与探测 RTT。
+// 注意：PeerConnection connected 只代表链路建立，类型必须以选中的 candidate pair 为准
+async function pollConnectionStats() {
+    if (!peerConnection || peerConnection.connectionState !== 'connected') {
+        if (!useWebRTC) {
+            diag.connectionType = useWsRelay() ? 'WebSocket 中继' : '-';
+        }
+        return;
+    }
+
+    try {
+        const stats = await peerConnection.getStats();
+        let pair = null;
+        stats.forEach((report) => {
+            if (report.type === 'candidate-pair' &&
+                (report.selected === true || report.nominated === true ||
+                 (report.state === 'succeeded' && report.selected === undefined && report.nominated === undefined && !pair))) {
+                if (!pair || report.selected || report.nominated) {
+                    pair = report;
+                }
+            }
+        });
+
+        if (pair) {
+            const local = stats.get(pair.localCandidateId);
+            const remote = stats.get(pair.remoteCandidateId);
+            diag.iceRtt = typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime * 1000 : null;
+            diag.selectedProtocol = pair.protocol || '-';
+            diag.localCandidateType = local ? local.candidateType : '-';
+            diag.remoteCandidateType = remote ? remote.candidateType : '-';
+
+            const isRelay = (local && local.candidateType === 'relay') || (remote && remote.candidateType === 'relay');
+            diag.connectionType = isRelay ? 'WebRTC TURN' : 'WebRTC 直连';
+        }
+    } catch (e) {
+        // 统计获取失败不影响主流程
+    }
+}
+
+function useWsRelay() {
+    return !useWebRTC && ws && ws.readyState === WebSocket.OPEN && currentDevice;
+}
+
+// 每秒采样：解码队列、统计面板刷新、状态文本更新
+function diagTick() {
+    if (videoDecoder && videoDecoder.state === 'configured') {
+        diag.decodeQueueSize = videoDecoder.decodeQueueSize;
+
+        // 解码压力早期信号：连续多个采样 ≥ 4 个 access unit 视为持续过载（方案 8.2）
+        diag.decodeQueueSamples.push(videoDecoder.decodeQueueSize);
+        if (diag.decodeQueueSamples.length > 5) {
+            diag.decodeQueueSamples.shift();
+        }
+        const samples = diag.decodeQueueSamples;
+        if (samples.length >= 3 && samples.slice(-3).every(q => q >= 4)) {
+            decoderOverloadSamples++;
+        } else {
+            decoderOverloadSamples = 0;
+        }
+        if (decoderOverloadSamples >= 3) {
+            decoderOverloadSamples = 0;
+            recoverFromDecoderOverload();
+        }
+    } else {
+        diag.decodeQueueSize = 0;
+    }
+
+    pollConnectionStats();
+    updateDiagnosticsPanel();
+    updateStatusTextWithConnectionType();
+}
+
+// 解码持续过载：重置解码器并请求新 IDR，从关键帧恢复（不使用 flush 追赶实时画面）。
+// reset 后不立即用旧配置 configure：优先等待流内 SPS/PPS 重建（覆盖过载期间
+// 旋转/改分辨率的场景）；编码端不重发带内配置时由 2 秒兜底定时器使用旧配置
+function recoverFromDecoderOverload() {
+    if (!isDecoderReady || !videoDecoder || videoDecoder.state === 'closed') {
+        return;
+    }
+    console.warn('[DECODER] 检测到持续解码积压，重置解码器并请求新关键帧');
+    videoDecoder.reset();
+    nalBuffer = [];
+    waitingForKeyframe = true;
+    diag.decodeQueueSamples = [];
+
+    if (decoderReconfigFallbackTimer) {
+        clearTimeout(decoderReconfigFallbackTimer);
+    }
+    decoderReconfigFallbackTimer = setTimeout(() => {
+        decoderReconfigFallbackTimer = null;
+        if (videoDecoder && videoDecoder.state === 'unconfigured' && lastDecoderConfig) {
+            console.warn('[DECODER] 流内未出现新 SPS/PPS，使用最近一次配置兜底');
+            try {
+                videoDecoder.configure(lastDecoderConfig);
+            } catch (e) {
+                console.error('[DECODER] 兜底配置失败:', e);
+            }
+        }
+    }, 2000);
+
+    requestKeyframeWithFallback('overload');
+}
+
+// 清理解码器恢复相关的定时器（切设备/断开时调用）
+function clearDecoderRecoveryTimers() {
+    if (keyframeFallbackTimer) {
+        clearTimeout(keyframeFallbackTimer);
+        keyframeFallbackTimer = null;
+    }
+    if (decoderReconfigFallbackTimer) {
+        clearTimeout(decoderReconfigFallbackTimer);
+        decoderReconfigFallbackTimer = null;
+    }
+}
+
+// 请求关键帧：优先轻量同步帧；2 秒内无新帧则回退旧版 resetVideo 语义
+function requestKeyframeWithFallback(reason) {
+    const now = Date.now();
+    if (now - lastKeyframeRequestAt < 500) {
+        return; // 合并重复请求
+    }
+    lastKeyframeRequestAt = now;
+
+    const framesBefore = frameCount;
+    if (isP2PControlReady()) {
+        dataChannel.send(JSON.stringify({ type: 'control', action: 'requestSyncFrame' }));
+    }
+
+    if (keyframeFallbackTimer) {
+        clearTimeout(keyframeFallbackTimer);
+    }
+    keyframeFallbackTimer = setTimeout(() => {
+        keyframeFallbackTimer = null;
+        if (frameCount === framesBefore && isP2PControlReady()) {
+            console.warn('[H264] 同步帧请求未见效果，回退 resetVideo (reason=%s)', reason);
+            dataChannel.send(JSON.stringify({ type: 'control', action: 'resetVideo' }));
+        }
+    }, 2000);
+}
+
+// 后台标签页恢复：检查帧龄，必要时请求新关键帧，避免回放后台期间的旧帧
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && currentDevice) {
+        const stale = !lastFrameTime || (performance.now() - lastFrameTime > 2000);
+        if (stale) {
+            console.log('[VIDEO] 页面恢复且画面过期，请求新关键帧');
+            requestKeyframeWithFallback('visibility');
+        }
+    }
+});
+
+function updateStatusTextWithConnectionType() {
+    // 普通界面仅显示连接类型与状态；详细指标在诊断面板
+    if (currentDevice && diag.connectionType && diag.connectionType !== '-') {
+        const statusText = document.getElementById('statusText');
+        if (statusText && !statusText.textContent.includes(diag.connectionType)) {
+            statusText.textContent = `已连接 (${diag.connectionType})`;
+        }
+    }
+}
+
+function updateDiagnosticsPanel() {
+    const content = document.getElementById('diagContent');
+    if (!content || document.getElementById('diagPanel')?.open !== true) {
+        return;
+    }
+
+    const fmtBytes = (v) => v === null || v === undefined ? '-' :
+        (v > 1024 ? `${(v / 1024).toFixed(1)} KB` : `${v} B`);
+    const fmtMs = (v) => v === null || v === undefined ? '-' : `${v.toFixed(1)} ms`;
+
+    const rttText = diag.iceRtt === null ? '-' : `${diag.iceRtt.toFixed(1)} ms`;
+    const q = diag.decodeQueueSamples.slice(-5).join(',') || '-';
+    content.innerHTML = `
+        <div>连接路径: ${diag.connectionType} (${diag.localCandidateType}→${diag.remoteCandidateType} ${diag.selectedProtocol})</div>
+        <div>ICE RTT: ${rttText}</div>
+        <div>码率: ${diag.kbpsIn.toFixed(0)} kbps | FPS: ${diag.fps.toFixed(1)} (目标 ${currentProfileTargetFps()})</div>
+        <div>解码队列: ${diag.decodeQueueSize} (近5s: ${q})</div>
+        <div>控制台发送水位: ${fmtBytes(diag.consoleBuffered)}</div>
+        <div>控制台帧 发送/丢弃: ${diag.consoleFramesSent ?? '-'} / ${diag.consoleFramesDropped ?? '-'}</div>
+        <div>绘制耗时: ${fmtMs(diag.drawMs)} | 首帧: ${diag.firstFrameMs === null ? '-' : `${(diag.firstFrameMs / 1000).toFixed(1)} s`}</div>
+        <div>画质档位: ${diag.profile} ${diag.profileArgs || ''}</div>
+        <div>关键帧模式: ${diag.keyframeMode}</div>
+    `;
+}
+
+function currentProfileTargetFps() {
+    switch (diag.profile) {
+        case 'interactive': return 60;
+        case 'sharp': return 60;
+        case 'weaknet': return 30;
+        case 'original': return '-';
+        default: return '-';
+    }
+}
+
+setInterval(diagTick, 1000);
+
 // 初始化视频解码器
 function initDecoder() {
     if (!('VideoDecoder' in window)) {
@@ -484,6 +822,8 @@ function configureDecoder(codecString, description) {
         videoDecoder.configure(config);
         console.log('[DECODER] ✅ 解码器配置成功');
         waitingForKeyframe = true; // 等待关键帧
+        lastDecoderConfig = config; // 过载恢复时重新 configure
+        diag.decodeQueueSamples = [];
         return true;
     } catch (e) {
         console.error('[DECODER] ❌ 配置失败:', e);
@@ -495,7 +835,7 @@ function configureDecoder(codecString, description) {
 // 帧解码完成回调
 function onFrameDecoded(frame) {
     frameCount++;
-    
+
     // 设置 canvas 尺寸
     if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
         canvas.width = frame.displayWidth;
@@ -503,26 +843,36 @@ function onFrameDecoded(frame) {
         adjustCanvasSize();
         console.log(`[DECODER] 视频分辨率: ${frame.displayWidth}x${frame.displayHeight}`);
     }
-    
+
     // 绘制帧到 canvas
+    const drawStart = performance.now();
     ctx.drawImage(frame, 0, 0);
     frame.close();
-    
+    diag.drawMs = performance.now() - drawStart;
+
+    if (pendingFirstFrameStart > 0) {
+        diag.firstFrameMs = performance.now() - pendingFirstFrameStart;
+        pendingFirstFrameStart = 0;
+        console.log(`[STATS] 首帧耗时: ${(diag.firstFrameMs / 1000).toFixed(2)} s`);
+    }
+
     // 计算帧率
     const now = performance.now();
     if (lastFrameTime > 0) {
         const delta = now - lastFrameTime;
         const fps = 1000 / delta;
-        
+
         // 每秒更新一次统计
         if (now - lastStatsTime > 1000) {
             console.log(`[STATS] FPS: ${fps.toFixed(1)}, 帧数: ${frameCount}, 接收: ${(bytesReceived / 1024).toFixed(1)} KB/s`);
-            lastStatsTime = now;
+            diag.fps = fps;
+            diag.kbpsIn = (bytesReceived * 8) / 1000;
             bytesReceived = 0;
+            lastStatsTime = now;
         }
     }
     lastFrameTime = now;
-    
+
     // 隐藏加载提示
     document.getElementById('loading').style.display = 'none';
 }
@@ -640,6 +990,16 @@ function handleTextMessage(data) {
                 console.error('[DEVICE] 启动失败:', message);
                 break;
 
+            case 'streamingStarted':
+                // 控制台上报的实际生效档位与参数
+                if (message.profile) {
+                    diag.profile = message.profile;
+                    diag.profileArgs = message.args || '';
+                    diag.keyframeMode = message.keyframeMode || '-';
+                    console.log(`[DEVICE] 推流已启动: 档位=${message.profile}, 参数=${message.args || '(默认)'}`);
+                }
+                break;
+
             // ========== WebRTC 信令消息 ==========
             case 'webrtc-offer':
                 // 收到控制台的 WebRTC Offer
@@ -688,23 +1048,32 @@ function handleBinaryMessage(data) {
 function decodeH264Data(data) {
     // 检查 NAL 起始码
     if (data.length < 4) return;
-    
+
     // 提取 NAL 单元
     const nalUnits = extractNalUnits(data);
-    
+
     for (const nal of nalUnits) {
         const nalType = nal.data[0] & 0x1F;
-        
+
         // SPS (7) 和 PPS (8) 用于配置解码器
         if (nalType === 7 || nalType === 8) {
             console.log(`[H264] 收到 ${nalType === 7 ? 'SPS' : 'PPS'}, 大小: ${nal.data.length}`);
             nalBuffer.push(nal);
-            
-            // 如果有 SPS 和 PPS，配置解码器
-            if (nalBuffer.length >= 2 && videoDecoder.state === 'unconfigured') {
+
+            // SPS/PPS 齐备后重建配置：unconfigured 直接配置；
+            // 已配置时与现行配置逐字节比较，仅在参数变化（旋转/改分辨率）时重配置。
+            // 编码器仅在重置时重发带内 SPS/PPS，因此不能无限追加历史数组
+            if (nalBuffer.length >= 2) {
                 const config = buildDecoderConfig(nalBuffer);
+                nalBuffer = [];
                 if (config) {
-                    configureDecoder(config.codec, config.description);
+                    if (videoDecoder.state === 'unconfigured') {
+                        configureDecoder(config.codec, config.description);
+                    } else if (videoDecoder.state === 'configured' &&
+                               !isSameDecoderConfig(config, lastDecoderConfig)) {
+                        console.log('[H264] 检测到编码参数变化，重置并重新配置解码器');
+                        configureDecoder(config.codec, config.description);
+                    }
                 }
             }
         }
@@ -717,7 +1086,7 @@ function decodeH264Data(data) {
                     console.log('[H264] 丢弃非关键帧，等待关键帧...');
                     continue;
                 }
-                
+
                 if (waitingForKeyframe && isKeyFrame) {
                     console.log('[H264] 收到首个关键帧，开始解码');
                     waitingForKeyframe = false;
@@ -729,7 +1098,7 @@ function decodeH264Data(data) {
                         timestamp: performance.now() * 1000,
                         data: nalToAVCC(nal.data)
                     });
-                    
+
                     videoDecoder.decode(chunk);
                 } catch (e) {
                     console.error('[DECODER] 解码失败:', e);
@@ -737,6 +1106,24 @@ function decodeH264Data(data) {
             }
         }
     }
+}
+
+// 比较两份解码器配置是否一致（codec 串 + avcC description 字节）
+function isSameDecoderConfig(a, b) {
+    if (!a || !b || a.codec !== b.codec) {
+        return false;
+    }
+    const da = a.description;
+    const db = b.description;
+    if (!da || !db || da.length !== db.length) {
+        return false;
+    }
+    for (let i = 0; i < da.length; i++) {
+        if (da[i] !== db[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // 提取 NAL 单元
@@ -1022,12 +1409,18 @@ function selectDevice(deviceId, evt) {
     currentDevice = deviceId;
     closeMobileDevicePanel();
 
+    // 递增 epoch：旧 DataChannel/WebSocket 回调的数据将被拒绝
+    currentEpoch++;
+    clearDecoderRecoveryTimers();
+
     // 重置解码器
     if (videoDecoder && videoDecoder.state !== 'unconfigured') {
         videoDecoder.reset();
     }
     nalBuffer = [];
     waitingForKeyframe = false;
+    lastDecoderConfig = null;
+    decoderOverloadSamples = 0;
 
     // 关闭之前的 WebRTC 连接（静默模式，因为可能立即建立新连接）
     closeWebRTC(true);
@@ -1047,6 +1440,7 @@ function selectDevice(deviceId, evt) {
         ws.send(JSON.stringify({
             type: 'selectDevice',
             deviceId: deviceId,
+            profile: selectedProfile, // 画质档位（控制台侧白名单校验）
             webrtc: webrtcEnabled // 告诉服务器我们支持 WebRTC
         }));
     }
@@ -1056,11 +1450,22 @@ function selectDevice(deviceId, evt) {
     document.getElementById('videoCanvas').style.display = 'block';
     document.getElementById('loading').style.display = 'flex';
 
-    // 重置统计
+    // 重置统计与诊断
     frameCount = 0;
     lastFrameTime = 0;
     lastStatsTime = performance.now();
     bytesReceived = 0;
+    pendingFirstFrameStart = performance.now();
+    diag.firstFrameMs = null;
+    diag.drawMs = null;
+    diag.fps = 0;
+    diag.kbpsIn = 0;
+    diag.connectionType = '-';
+    diag.iceRtt = null;
+    diag.consoleBuffered = null;
+    diag.consoleFramesSent = null;
+    diag.consoleFramesDropped = null;
+    diag.decodeQueueSamples = [];
 }
 
 // 发送控制指令
@@ -1101,7 +1506,14 @@ function disconnect() {
     }
 
     // 关闭 WebRTC 连接
+    if (keyframeFallbackTimer) {
+        clearTimeout(keyframeFallbackTimer);
+        keyframeFallbackTimer = null;
+    }
     closeWebRTC();
+    currentEpoch++;
+    diag.connectionType = '-';
+    diag.profile = selectedProfile;
 
     currentDevice = null;
 

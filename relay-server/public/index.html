@@ -356,6 +356,47 @@
         .btn.danger:hover {
             background: #c0392b;
         }
+
+        .profile-select {
+            padding: 8px 10px;
+            border: none;
+            border-radius: 5px;
+            background: #0f9d8a;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .diag-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 15;
+            max-width: 320px;
+            background: rgba(16, 24, 40, 0.82);
+            color: #e5ecff;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            font-size: 12px;
+            backdrop-filter: blur(8px);
+        }
+
+        .diag-panel summary {
+            padding: 6px 10px;
+            cursor: pointer;
+            user-select: none;
+            font-weight: 600;
+        }
+
+        .diag-content {
+            padding: 4px 10px 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            color: #c6d4f5;
+            line-height: 1.5;
+            word-break: break-all;
+        }
         
         /* 模态框样式 */
         .modal {
@@ -651,6 +692,19 @@
                 font-size: 11px;
             }
 
+            .profile-select {
+                flex: 0 0 auto;
+                min-width: 74px;
+                padding: 8px 6px;
+                border-radius: 9px;
+                font-size: 11px;
+            }
+
+            .diag-panel {
+                max-width: 78vw;
+                font-size: 10px;
+            }
+
             .no-device {
                 font-size: 15px;
                 padding: 0 14px;
@@ -734,9 +788,14 @@
                         <div class="spinner"></div>
                         <div>正在连接...</div>
                     </div>
+                    <details id="diagPanel" class="diag-panel">
+                        <summary>🩺 链路诊断</summary>
+                        <div id="diagContent" class="diag-content">等待连接...</div>
+                    </details>
                 </div>
                 
                 <div class="controls">
+                    <select id="videoProfileSelect" class="profile-select" title="画质档位（切换需重启视频）"></select>
                     <button class="btn" onclick="sendControl('home')">🏠 主页</button>
                     <button class="btn" onclick="sendControl('back')">⬅️ 返回</button>
                     <button class="btn" onclick="sendControl('recent')">📋 最近任务</button>

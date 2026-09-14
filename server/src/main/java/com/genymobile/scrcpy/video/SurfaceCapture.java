@@ -19,6 +19,18 @@ public abstract class SurfaceCapture {
     private CaptureListener listener;
 
     /**
+     * Request a sync (IDR) frame from the running encoder without resetting the capture.
+     *
+     * @return {@code true} if the request was delivered to a running encoder
+     */
+    public boolean requestSyncFrame() {
+        if (listener instanceof CaptureReset) {
+            return ((CaptureReset) listener).requestSyncFrame();
+        }
+        return false;
+    }
+
+    /**
      * Notify the listener that the capture has been invalidated (for example, because its size changed).
      */
     protected void invalidate() {

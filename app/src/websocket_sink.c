@@ -44,7 +44,8 @@ handle_control_message(struct sc_websocket_sink *ws, const char *message) {
     strncpy(action, action_start, len);
     action[len] = '\0';
     
-    LOGI("Received control action: %s", action);
+    // 高频触摸下逐条打印会产生明显开销，降为 DEBUG
+    LOGD("Received control action: %s", action);
     
     struct sc_control_msg msg;
     memset(&msg, 0, sizeof(msg));
@@ -122,6 +123,15 @@ handle_control_message(struct sc_websocket_sink *ws, const char *message) {
             LOGW("Could not request reset video");
         } else {
             LOGI("Requested encoder reset for keyframe");
+        }
+    }
+    else if (strcmp(action, "requestSyncFrame") == 0) {
+        // 轻量同步帧请求：不重置捕获/编码链路（需要配套的 scrcpy-server 支持）
+        msg.type = SC_CONTROL_MSG_TYPE_REQUEST_SYNC_FRAME;
+        if (!sc_controller_push_msg(ws->controller, &msg)) {
+            LOGW("Could not request sync frame");
+        } else {
+            LOGI("Requested sync frame");
         }
     }
     else if (strcmp(action, "touch") == 0) {

@@ -33,6 +33,13 @@ void close_local_client(const char* serial);
 // 发送控制消息到 scrcpy
 bool send_control_to_scrcpy(const char* serial, const uint8_t* data, size_t len);
 
+// 请求设备关键帧：优先轻量同步帧请求，连续无效时回退完整重置
+// （SCRCPY_KEYFRAME_SYNC=0 时始终使用旧 resetVideo 方案）
+bool request_device_keyframe(const char* serial);
+
+// 查询轻量同步帧请求是否启用（用于展示/上报当前策略）
+bool local_relay_sync_keyframe_enabled(void);
+
 // 设置视频连接建立回调
 void set_video_connect_callback(VideoConnectCallback callback);
 

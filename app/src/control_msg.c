@@ -188,6 +188,7 @@ sc_control_msg_serialize(const struct sc_control_msg *msg, uint8_t *buf) {
         case SC_CONTROL_MSG_TYPE_ROTATE_DEVICE:
         case SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS:
         case SC_CONTROL_MSG_TYPE_RESET_VIDEO:
+        case SC_CONTROL_MSG_TYPE_REQUEST_SYNC_FRAME:
             // no additional data
             return 1;
         default:
@@ -317,6 +318,9 @@ sc_control_msg_log(const struct sc_control_msg *msg) {
             break;
         case SC_CONTROL_MSG_TYPE_RESET_VIDEO:
             LOG_CMSG("reset video");
+            break;
+        case SC_CONTROL_MSG_TYPE_REQUEST_SYNC_FRAME:
+            LOG_CMSG("request sync frame");
             break;
         default:
             LOG_CMSG("unknown type: %u", (unsigned) msg->type);

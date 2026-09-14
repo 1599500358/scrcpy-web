@@ -38,7 +38,15 @@ typedef struct {
     uint8_t cached_pps[1024];
     int cached_pps_len;
     DWORD last_keyframe_request_tick;
+    int keyframe_fail_streak;   // 连续请求关键帧但未见 IDR 的次数
+    int keyframe_reset_cycles;  // 已回退完整重置的轮数（防止无限重置循环）
+    bool control_send_failed_logged; // 控制通道发送失败是否已告警（避免日志刷屏）
 } LocalScrcpyClient;
+
+// 控制连接发送串行化：触摸转发（WebRTC 回调线程）与关键帧请求（视频转发线程）
+// 可能并发写同一控制 socket，必须保证单个 WebSocket 帧的完整发送不与其他帧交错
+static CRITICAL_SECTION g_control_send_cs;
+static bool g_control_send_cs_ready = false;
 
 static LocalScrcpyClient local_clients[MAX_LOCAL_CLIENTS];
 static int local_client_count = 0;
@@ -63,6 +71,33 @@ typedef enum {
 // 设置视频连接建立回调
 void set_video_connect_callback(VideoConnectCallback callback) {
     g_video_connect_callback = callback;
+}
+
+// TCP_NODELAY 开关（LOCAL_CONTROL_TCP_NODELAY=0 可关闭，用于收益对照）
+static bool local_relay_tcp_nodelay_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = getenv("LOCAL_CONTROL_TCP_NODELAY");
+        cached = (env && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+// 对接受成功的连接启用低延迟参数；失败仅提示一次，不影响连接建立
+static void enable_low_latency_socket(SOCKET sock, const char* kind) {
+    if (!local_relay_tcp_nodelay_enabled()) {
+        return;
+    }
+    BOOL nodelay = 1;
+    if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                   (const char*)&nodelay, sizeof(nodelay)) == SOCKET_ERROR) {
+        static bool nodelay_warned = false;
+        if (!nodelay_warned) {
+            print_log("WARN", "[LocalRelay] %s 连接设置 TCP_NODELAY 失败: wsa=%d（仅提示一次）",
+                      kind, WSAGetLastError());
+            nodelay_warned = true;
+        }
+    }
 }
 
 // 查找本地客户端
@@ -92,6 +127,9 @@ static LocalScrcpyClient* create_local_client(const char* serial) {
             local_clients[i].cached_sps_len = 0;
             local_clients[i].cached_pps_len = 0;
             local_clients[i].last_keyframe_request_tick = 0;
+            local_clients[i].keyframe_fail_streak = 0;
+            local_clients[i].keyframe_reset_cycles = 0;
+            local_clients[i].control_send_failed_logged = false;
             if (i >= local_client_count) {
                 local_client_count = i + 1;
             }
@@ -114,6 +152,7 @@ static bool socket_send_all(SOCKET sock, const uint8_t* data, int len) {
 }
 
 // WebSocket 文本帧发送（服务器端不需要 mask）
+// 头部和正文组合到同一缓冲区一次性发出，避免分离 send 产生的小包等待
 static int ws_send_unmasked(SOCKET sock, const uint8_t* data, size_t len) {
     uint8_t header[10];
     int header_len = 2;
@@ -135,14 +174,86 @@ static int ws_send_unmasked(SOCKET sock, const uint8_t* data, size_t len) {
         header_len = 10;
     }
 
+    // 控制消息通常很小，栈上缓冲即可；超长时退回堆分配
+    uint8_t stack_buf[1024];
+    uint8_t* combined = NULL;
+    uint8_t* heap_buf = NULL;
+    if (header_len + (int)len <= (int)sizeof(stack_buf)) {
+        combined = stack_buf;
+    } else {
+        heap_buf = (uint8_t*)malloc(header_len + len);
+        if (heap_buf) {
+            combined = heap_buf;
+        }
+    }
+
+    if (combined) {
+        memcpy(combined, header, header_len);
+        memcpy(combined + header_len, data, len);
+        bool ok = socket_send_all(sock, combined, header_len + (int)len);
+        if (heap_buf) {
+            free(heap_buf);
+        }
+        if (!ok) {
+            return -1;
+        }
+        return (int)len;
+    }
+
+    // 堆分配失败：退回分开发送，保证正确性
     if (!socket_send_all(sock, header, header_len)) {
         return -1;
     }
-
     if (!socket_send_all(sock, data, (int)len)) {
         return -1;
     }
     return (int)len;
+}
+
+// 控制连接的串行化发送：进入临界区后重新校验连接有效性，再完整发送单个帧
+static bool control_socket_send_frame(LocalScrcpyClient* client, const uint8_t* data, size_t len) {
+    if (!client || !g_control_send_cs_ready) {
+        return false;
+    }
+
+    bool ok = false;
+    EnterCriticalSection(&g_control_send_cs);
+    if (client->active && client->control_socket != INVALID_SOCKET) {
+        ok = ws_send_unmasked(client->control_socket, data, len) > 0;
+        if (ok) {
+            // 通道恢复后重新允许下一次失败的告警
+            client->control_send_failed_logged = false;
+        }
+    }
+    LeaveCriticalSection(&g_control_send_cs);
+    return ok;
+}
+
+// 控制通道发送失败只告警一次，恢复后由 control_socket_send_frame 复位
+static void log_control_send_failure_once(LocalScrcpyClient* client) {
+    if (client && !client->control_send_failed_logged) {
+        client->control_send_failed_logged = true;
+        print_log("WARN", "[LocalRelay] 控制通道发送失败，等待通道恢复: %s（后续失败不再重复打印）",
+                  client->serial);
+    }
+}
+
+// 关闭控制连接时同样持锁，避免与正在进行的帧发送并发操作同一 socket
+static void close_control_socket_locked(LocalScrcpyClient* client) {
+    if (!client || client->control_socket == INVALID_SOCKET) {
+        return;
+    }
+    if (g_control_send_cs_ready) {
+        EnterCriticalSection(&g_control_send_cs);
+        if (client->control_socket != INVALID_SOCKET) {
+            closesocket(client->control_socket);
+            client->control_socket = INVALID_SOCKET;
+        }
+        LeaveCriticalSection(&g_control_send_cs);
+    } else {
+        closesocket(client->control_socket);
+        client->control_socket = INVALID_SOCKET;
+    }
 }
 
 static int recv_http_headers(SOCKET sock, char* request, int request_size) {
@@ -442,14 +553,58 @@ static void update_h264_cache(LocalScrcpyClient* client, const uint8_t* data, in
     }
 }
 
+// 轻量同步帧请求开关（SCRCPY_KEYFRAME_SYNC=0 可回退到旧的 resetVideo 方案）。
+// requestSyncFrame 依赖 scrcpy-server 与 scrcpy.exe 同版本构建（控制协议类型 18）；
+// 混用旧版 scrcpy-server 时必须置 0。
+static bool sync_keyframe_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = getenv("SCRCPY_KEYFRAME_SYNC");
+        cached = (env && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+// 请求关键帧：优先使用轻量同步帧请求（不重置捕获/编码链路）；
+// 连续 2 次（约 1 秒）未观察到 IDR 时允许一次完整重置；重复失败则停止重置循环
 static void request_scrcpy_keyframe(LocalScrcpyClient* client) {
     if (!client || client->control_socket == INVALID_SOCKET) {
         return;
     }
 
+    // 已连续多轮回退重置仍无 IDR：进入明确失败状态，停止请求避免重置循环
+    if (client->keyframe_reset_cycles > 5) {
+        return;
+    }
+
+    bool use_sync = sync_keyframe_enabled() && client->keyframe_fail_streak < 2;
+    if (use_sync) {
+        static const char* sync_msg = "{\"type\":\"control\",\"action\":\"requestSyncFrame\"}";
+        if (control_socket_send_frame(client, (const uint8_t*)sync_msg, strlen(sync_msg)) > 0) {
+            client->keyframe_fail_streak++;
+            print_log("DEBUG", "[LocalRelay] 已请求同步帧: %s (streak=%d)",
+                      client->serial, client->keyframe_fail_streak);
+            return;
+        }
+        log_control_send_failure_once(client);
+    }
+
     static const char* reset_msg = "{\"type\":\"control\",\"action\":\"resetVideo\"}";
-    if (ws_send_unmasked(client->control_socket, (const uint8_t*)reset_msg, strlen(reset_msg)) > 0) {
-        print_log("INFO", "[LocalRelay] 已请求关键帧: %s", client->serial);
+    if (control_socket_send_frame(client, (const uint8_t*)reset_msg, strlen(reset_msg)) > 0) {
+        if (use_sync) {
+            // 同步帧路径未生效，回退完整重置
+            client->keyframe_reset_cycles++;
+            if (client->keyframe_reset_cycles == 6) {
+                print_log("ERROR", "[LocalRelay] 关键帧恢复连续失败，已停止请求以避免重置循环，请重新选择设备: %s",
+                          client->serial);
+            } else {
+                print_log("INFO", "[LocalRelay] 同步帧请求未见 IDR，已回退完整重置 (cycle=%d): %s",
+                          client->keyframe_reset_cycles, client->serial);
+            }
+        }
+        client->keyframe_fail_streak = 0;
+    } else {
+        log_control_send_failure_once(client);
     }
 }
 
@@ -467,6 +622,9 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
     int frame_count = 0;
     int drop_count = 0;
+    // 轻量同步帧请求最短间隔 500ms；完整重置路径保持 1s，避免频繁触发编码重置
+    const DWORD keyframe_request_interval = sync_keyframe_enabled() ? 500 : 1000;
+    DWORD last_metrics_tick = GetTickCount();
 
     while (client->active && client->video_socket != INVALID_SOCKET) {
         int len = recv_ws_frame(client->video_socket, video_buffer, VIDEO_BUFFER_SIZE);
@@ -479,6 +637,12 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
         bool has_idr = false;
         update_h264_cache(client, video_buffer, len, &has_idr);
+
+        if (has_idr) {
+            // 拿到 IDR 说明关键帧恢复已生效，复位失败计数
+            client->keyframe_fail_streak = 0;
+            client->keyframe_reset_cycles = 0;
+        }
 
         if (!client->first_frame_seen) {
             client->first_frame_seen = true;
@@ -500,7 +664,7 @@ static unsigned __stdcall video_relay_thread(void* param) {
                     drop_count++;
                     DWORD now = GetTickCount();
                     if (client->last_keyframe_request_tick == 0 ||
-                        now - client->last_keyframe_request_tick >= 1000) {
+                        now - client->last_keyframe_request_tick >= keyframe_request_interval) {
                         request_scrcpy_keyframe(client);
                         client->last_keyframe_request_tick = now;
                     }
@@ -525,10 +689,12 @@ static unsigned __stdcall video_relay_thread(void* param) {
 
             bool sent = webrtc_send_video(device_id, video_buffer, len);
             if (!sent) {
+                // 发送失败（含水位居压触发）：按整帧失败处理，
+                // 停止提交后续依赖帧，等待匹配配置的新 IDR 后再恢复
                 drop_count++;
-                if (drop_count < 5) {
-                    print_log("WARN", "[LocalRelay] WebRTC 发送失败: %s", client->serial);
-                }
+                client->webrtc_stream_ready = false;
+                client->last_keyframe_request_tick = 0;
+                print_log("WARN", "[LocalRelay] WebRTC 发送失败，等待新关键帧恢复: %s", client->serial);
             }
         } else {
             if (client->webrtc_stream_ready) {
@@ -539,6 +705,21 @@ static unsigned __stdcall video_relay_thread(void* param) {
             if (drop_count == 1 || drop_count % 100 == 0) {
                 print_log("WARN", "[LocalRelay] WebRTC 未连接 (state=%d), 丢帧: %d", state, drop_count);
             }
+        }
+
+        // 每 2 秒向浏览器推送一次控制台侧链路指标（诊断面板数据源）
+        DWORD now_tick = GetTickCount();
+        if (now_tick - last_metrics_tick >= 2000) {
+            last_metrics_tick = now_tick;
+            char metrics_json[256];
+            snprintf(metrics_json, sizeof(metrics_json),
+                "{\"type\":\"consoleMetrics\",\"bufferedAmount\":%d,"
+                "\"framesSent\":%llu,\"framesDropped\":%llu,\"relayDropped\":%d}",
+                webrtc_get_buffered_amount(device_id),
+                (unsigned long long)webrtc_get_frames_sent(device_id),
+                (unsigned long long)webrtc_get_frames_dropped(device_id),
+                drop_count);
+            webrtc_send_text(device_id, metrics_json);
         }
 
         // 每 100 帧打印一次统计
@@ -582,6 +763,10 @@ static unsigned __stdcall local_server_listener(void* param) {
                 char serial[256] = {0};
                 WsConnType conn_type = WS_CONN_UNKNOWN;
                 if (do_websocket_handshake(client_sock, serial, sizeof(serial), &conn_type)) {
+                    // 握手成功后启用低延迟参数（TCP_NODELAY，可用环境变量关闭）
+                    enable_low_latency_socket(client_sock,
+                        conn_type == WS_CONN_CONTROL ? "control" : "video");
+
                     LocalScrcpyClient* client = find_local_client(serial);
                     if (!client) {
                         client = create_local_client(serial);
@@ -600,9 +785,7 @@ static unsigned __stdcall local_server_listener(void* param) {
                     }
 
                     if (conn_type == WS_CONN_CONTROL) {
-                        if (client->control_socket != INVALID_SOCKET) {
-                            closesocket(client->control_socket);
-                        }
+                        close_control_socket_locked(client);
                         client->control_socket = client_sock;
                         print_log("INFO", "[LocalRelay] 控制连接已建立: %s", serial);
                     } else {
@@ -615,6 +798,9 @@ static unsigned __stdcall local_server_listener(void* param) {
                         client->cached_sps_len = 0;
                         client->cached_pps_len = 0;
                         client->last_keyframe_request_tick = 0;
+                        client->keyframe_fail_streak = 0;
+                        client->keyframe_reset_cycles = 0;
+                        client->control_send_failed_logged = false;
                         print_log("INFO", "[LocalRelay] 视频连接已建立: %s", serial);
 
                         // 启动视频转发线程
@@ -636,6 +822,11 @@ static unsigned __stdcall local_server_listener(void* param) {
 // 初始化本地服务器
 bool init_local_video_relay() {
     // Winsock 已在主程序初始化，无需重复调用 WSAStartup
+    if (!g_control_send_cs_ready) {
+        InitializeCriticalSection(&g_control_send_cs);
+        g_control_send_cs_ready = true;
+    }
+
     local_server_port = 0;
     local_server_socket = INVALID_SOCKET;
 
@@ -721,14 +912,13 @@ bool init_local_video_relay() {
 void stop_local_video_relay() {
     local_server_running = false;
 
-    // 关闭所有客户端连接
+    // 关闭所有客户端连接（控制连接持锁关闭，避免与帧发送并发）
     for (int i = 0; i < local_client_count; i++) {
         if (local_clients[i].video_socket != INVALID_SOCKET) {
             closesocket(local_clients[i].video_socket);
+            local_clients[i].video_socket = INVALID_SOCKET;
         }
-        if (local_clients[i].control_socket != INVALID_SOCKET) {
-            closesocket(local_clients[i].control_socket);
-        }
+        close_control_socket_locked(&local_clients[i]);
         local_clients[i].active = false;
     }
 
@@ -743,6 +933,8 @@ void stop_local_video_relay() {
         CloseHandle(local_server_thread);
         local_server_thread = NULL;
     }
+
+    // 临界区保留到进程退出：视频转发线程可能仍在使用，销毁中的 CS 不可重入
 
     // Winsock 清理由主程序处理
     print_log("INFO", "[LocalRelay] 本地视频服务器已停止");
@@ -789,22 +981,33 @@ void close_local_client(const char* serial) {
             closesocket(client->video_socket);
             client->video_socket = INVALID_SOCKET;
         }
-        if (client->control_socket != INVALID_SOCKET) {
-            closesocket(client->control_socket);
-            client->control_socket = INVALID_SOCKET;
-        }
+        close_control_socket_locked(client);
         client->active = false;
         print_log("INFO", "[LocalRelay] 已关闭本地客户端: %s", serial);
     }
 }
 
-// 发送控制消息到 scrcpy
+// 发送控制消息到 scrcpy（串行化，保证与其他线程的帧发送不交错）
 bool send_control_to_scrcpy(const char* serial, const uint8_t* data, size_t len) {
     LocalScrcpyClient* client = find_local_client(serial);
-    if (client && client->control_socket != INVALID_SOCKET) {
-        return ws_send_unmasked(client->control_socket, data, len) > 0;
+    if (client) {
+        return control_socket_send_frame(client, data, len);
     }
     return false;
+}
+
+// 供外部（如 requestKeyFrame 消息处理）调用的关键帧请求入口，复用内部重试/回退策略
+bool request_device_keyframe(const char* serial) {
+    LocalScrcpyClient* client = find_local_client(serial);
+    if (!client || client->control_socket == INVALID_SOCKET) {
+        return false;
+    }
+    request_scrcpy_keyframe(client);
+    return true;
+}
+
+bool local_relay_sync_keyframe_enabled(void) {
+    return sync_keyframe_enabled();
 }
 
 #else
@@ -818,4 +1021,9 @@ bool send_control_to_scrcpy(const char* serial, const uint8_t* data, size_t len)
     (void)serial; (void)data; (void)len;
     return false;
 }
+bool request_device_keyframe(const char* serial) {
+    (void)serial;
+    return false;
+}
+bool local_relay_sync_keyframe_enabled(void) { return false; }
 #endif // USE_WEBRTC

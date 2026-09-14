@@ -1,6 +1,7 @@
 package com.genymobile.scrcpy.video;
 
 import android.media.MediaCodec;
+import android.os.Bundle;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -23,6 +24,30 @@ public class CaptureReset implements SurfaceCapture.CaptureListener {
             } catch (IllegalStateException e) {
                 // ignore
             }
+        }
+    }
+
+    /**
+     * Request a sync (IDR) frame on the running encoder without interrupting it.
+     * <p>
+     * Synchronized with {@link #setRunningMediaCodec(MediaCodec)} so the request
+     * cannot race with codec stop/reset/release: a codec that is being torn down
+     * either still accepts the request (harmless) or throws (caught below).
+     *
+     * @return {@code true} if the request was delivered to a running codec
+     */
+    public synchronized boolean requestSyncFrame() {
+        MediaCodec codec = runningMediaCodec;
+        if (codec == null) {
+            return false;
+        }
+        try {
+            Bundle params = new Bundle();
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+            codec.setParameters(params);
+            return true;
+        } catch (IllegalStateException e) {
+            return false;
         }
     }
 

@@ -21,6 +21,10 @@
 #define VIDEO_CHUNK_HEADER_SIZE 6
 #define VIDEO_CHUNK_PAYLOAD_MAX (60 * 1024)
 
+// 发送水位默认预算：original 档 8 Mbps × 100ms / 8 = 100KB。
+// 启动设备时由控制台按实际档位码率调用 webrtc_set_send_budget() 覆盖
+#define DEFAULT_SEND_BUDGET_BYTES (100 * 1024)
+
 // 设备 WebRTC 连接信息
 typedef struct {
     char device_id[256];
@@ -28,6 +32,9 @@ typedef struct {
     int dc;  // DataChannel ID
     WebRTCState state;
     uint32_t next_frame_seq;
+    uint64_t frames_sent;
+    uint64_t frames_dropped;
+    size_t send_budget_bytes;   // DataChannel 发送水位预算（字节），0 表示不限制
     char local_sdp[SDP_BUFFER_SIZE];
     char remote_sdp[SDP_BUFFER_SIZE];
     char ice_candidates[MAX_ICE_CANDIDATES][512];
@@ -42,6 +49,7 @@ static int g_connection_count = 0;
 static WebRTCStateCallback g_state_callback = NULL;
 static WebRTCMessageCallback g_message_callback = NULL;
 static WebRTCDataMessageCallback g_data_message_callback = NULL;
+static size_t g_send_budget_bytes = DEFAULT_SEND_BUDGET_BYTES;
 
 // 查找设备连接
 static DeviceConnection* find_connection(const char* device_id) {
@@ -66,9 +74,33 @@ static DeviceConnection* create_connection(const char* device_id) {
     conn->dc = -1;
     conn->state = WEBRTC_STATE_DISCONNECTED;
     conn->next_frame_seq = 1;
+    conn->send_budget_bytes = g_send_budget_bytes;
     g_connection_count++;
 
     return conn;
+}
+
+// 按 libdatachannel 的 URI 规则对 userinfo 组件做百分号编码（保留字符必须转义）
+static bool percent_encode_userinfo(const char* input, char* output, size_t output_size) {
+    static const char* hex = "0123456789ABCDEF";
+    size_t out = 0;
+    for (const char* p = input; p && *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                          c == '_' || c == '~';
+        if (unreserved) {
+            if (out + 1 >= output_size) return false;
+            output[out++] = (char)c;
+        } else {
+            if (out + 3 >= output_size) return false;
+            output[out++] = '%';
+            output[out++] = hex[(c >> 4) & 0xF];
+            output[out++] = hex[c & 0xF];
+        }
+    }
+    output[out] = '\0';
+    return true;
 }
 
 #ifdef USE_WEBRTC
@@ -323,7 +355,9 @@ char* webrtc_create_offer(const char* device_id) {
     // 设置 STUN/TURN 服务器 (使用静态数组)
     static const char* ice_servers[4] = {NULL, NULL, NULL, NULL};
     static char stun_url[256] = {0};
-    static char turn_url[512] = {0};
+    // 结构体字段上限：username/password 各 127 字节、host 255 字节，百分号编码后
+    // URI 最长约 3*127*2 + 255 + 固定开销 ≈ 1040 字节，1280 缓冲不会截断
+    static char turn_url[1280] = {0};
 
     int server_count = 0;
 
@@ -336,12 +370,24 @@ char* webrtc_create_offer(const char* device_id) {
     ice_servers[server_count++] = stun_url;
 
     // TURN 服务器（如果配置了）
+    // libdatachannel 要求标准 TURN URI：turn:<user>:<pass>@<host>[:port][?transport=udp]，
+    // 凭据中的保留字符需百分号编码；空格拼接格式无法通过解析
     if (g_config.turn_server[0] && g_config.turn_username[0]) {
-        snprintf(turn_url, sizeof(turn_url), "turn:%s %s %s",
-            g_config.turn_server,
-            g_config.turn_username,
-            g_config.turn_password);
-        ice_servers[server_count++] = turn_url;
+        char user_enc[512] = {0};
+        char pass_enc[512] = {0};
+        if (!percent_encode_userinfo(g_config.turn_username, user_enc, sizeof(user_enc)) ||
+            !percent_encode_userinfo(g_config.turn_password, pass_enc, sizeof(pass_enc))) {
+            printf("[WebRTC] TURN 凭据编码失败，忽略 TURN 配置\n");
+        } else {
+            int url_len = snprintf(turn_url, sizeof(turn_url), "turn:%s:%s@%s?transport=udp",
+                user_enc, pass_enc, g_config.turn_server);
+            if (url_len < 0 || url_len >= (int)sizeof(turn_url)) {
+                // 截断会产生非法 URI 导致 TURN 静默失效，必须显式失败
+                printf("[WebRTC] TURN URI 构建超限 (len=%d)，忽略 TURN 配置\n", url_len);
+            } else {
+                ice_servers[server_count++] = turn_url;
+            }
+        }
     }
 
     conf.iceServers = ice_servers;
@@ -444,6 +490,16 @@ bool webrtc_send_video(const char* device_id, const uint8_t* data, size_t len) {
         conn->next_frame_seq = 1;
     }
 
+    // 帧入队前检查 DataChannel 发送水位：超过预算说明网络排空不及时，
+    // 继续发送只会累积旧画面。返回 false 让转发线程停止提交依赖帧并等待新 IDR
+    if (conn->send_budget_bytes > 0) {
+        int buffered = rtcGetBufferedAmount(conn->dc);
+        if (buffered >= 0 && (size_t)buffered > conn->send_budget_bytes) {
+            conn->frames_dropped++;
+            return false;
+        }
+    }
+
     uint8_t packet[VIDEO_CHUNK_HEADER_SIZE + VIDEO_CHUNK_PAYLOAD_MAX];
     size_t offset = 0;
     while (offset < len) {
@@ -473,13 +529,59 @@ bool webrtc_send_video(const char* device_id, const uint8_t* data, size_t len) {
         if (result < 0) {
             printf("[WebRTC] 发送视频分片失败: device=%s frame=%u offset=%zu chunk=%zu total=%zu\n",
                    device_id, frame_seq, offset, chunk_len, len);
+            conn->frames_dropped++;
             return false;
         }
 
         offset += chunk_len;
     }
 
+    conn->frames_sent++;
     return true;
+#else
+    return false;
+#endif
+}
+
+void webrtc_set_send_budget(size_t bytes) {
+    g_send_budget_bytes = bytes;
+#ifdef USE_WEBRTC
+    for (int i = 0; i < g_connection_count; i++) {
+        g_connections[i].send_budget_bytes = bytes;
+    }
+#endif
+}
+
+int webrtc_get_buffered_amount(const char* device_id) {
+#ifdef USE_WEBRTC
+    DeviceConnection* conn = find_connection(device_id);
+    if (!conn || conn->dc < 0) {
+        return -1;
+    }
+    return rtcGetBufferedAmount(conn->dc);
+#else
+    return -1;
+#endif
+}
+
+uint64_t webrtc_get_frames_sent(const char* device_id) {
+    DeviceConnection* conn = find_connection(device_id);
+    return conn ? conn->frames_sent : 0;
+}
+
+uint64_t webrtc_get_frames_dropped(const char* device_id) {
+    DeviceConnection* conn = find_connection(device_id);
+    return conn ? conn->frames_dropped : 0;
+}
+
+// 通过 DataChannel 发送文本消息（用于指标上报；size=-1 表示文本）
+bool webrtc_send_text(const char* device_id, const char* text) {
+#ifdef USE_WEBRTC
+    DeviceConnection* conn = find_connection(device_id);
+    if (!conn || conn->dc < 0 || conn->state != WEBRTC_STATE_CONNECTED || !text) {
+        return false;
+    }
+    return rtcSendMessage(conn->dc, text, -1) >= 0;
 #else
     return false;
 #endif

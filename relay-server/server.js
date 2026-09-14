@@ -36,8 +36,56 @@ const app = express();
 const authManager = new AuthManager(path.join(__dirname, 'auth-config.json'));
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 8 * 1024 * 1024);
+// 观看者发送积压阈值：超过该值跳过该观看者的普通帧并请求关键帧，
+// 恢复带宽后从新 IDR 继续。默认 1MiB（约 4Mbps 下 2 秒排空量），远小于旧默认 8MiB
+const VIEWER_MAX_BUFFERED_AMOUNT = Number(process.env.VIEWER_MAX_BUFFERED_AMOUNT || 1 * 1024 * 1024);
 const ENABLE_VIDEO_LOG = process.env.ENABLE_VIDEO_LOG === 'true';
 const IDLE_TIMEOUT = Number(process.env.IDLE_TIMEOUT || 300000); // 默认5分钟空闲超时（毫秒）
+
+// 画质档位白名单（与控制台 VIDEO_PROFILES 保持一致）：
+// 浏览器传入的 profile 仅作校验后的索引转发，不接收任意命令行参数
+const VIDEO_PROFILES = new Set(['original', 'interactive', 'weaknet', 'sharp']);
+function normalizeVideoProfile(profile) {
+    return VIDEO_PROFILES.has(profile) ? profile : undefined;
+}
+
+// 检测 Annex-B H.264 数据中是否包含 IDR 帧（NAL type 5）。
+// 编码器输出带 emulation prevention，NAL 负载内不会出现伪造的 00 00 01 起始码
+function containsH264Idr(buf) {
+    if (!Buffer.isBuffer(buf)) return false;
+    for (let i = 0; i + 3 < buf.length; i++) {
+        if (buf[i] === 0 && buf[i + 1] === 0) {
+            if (buf[i + 2] === 1) {
+                if ((buf[i + 3] & 0x1F) === 5) return true;
+                i += 2;
+            } else if (buf[i + 2] === 0 && buf[i + 3] === 1) {
+                if (i + 4 < buf.length && (buf[i + 4] & 0x1F) === 5) return true;
+                i += 3;
+            }
+        }
+    }
+    return false;
+}
+
+// 观看者背压状态（ws -> { skipping, lastKeyframeReqAt }）
+const viewerBackpressure = new WeakMap();
+
+// 请求设备输出关键帧：优先轻量同步帧，经控制 WS 直达 scrcpy
+function requestDeviceKeyframe(device, serial, forceReset = false) {
+    const controlWs = device && device.controlWs;
+    if (!controlWs || controlWs.readyState !== WebSocket.OPEN) {
+        return false;
+    }
+    const action = forceReset ? 'resetVideo' : 'requestSyncFrame';
+    try {
+        controlWs.send(JSON.stringify({ type: 'control', serial, action }));
+        log('INFO', `[关键帧] 已请求设备 ${serial} 关键帧 (${action})`);
+        return true;
+    } catch (e) {
+        log('WARN', `[关键帧] 请求设备 ${serial} 关键帧失败:`, e.message);
+        return false;
+    }
+}
 
 // 双模式配置：同时支持 HTTP 和 HTTPS
 const HTTP_PORT = process.env.HTTP_PORT || 8080;  // 本地 scrcpy 使用
@@ -661,13 +709,44 @@ function continueWebSocketConnection(ws, req, params, clientType, user) {
             if (Buffer.isBuffer(data) && foundDevice) {
                 // 更新设备最后活动时间
                 foundDevice.lastActivityTime = Date.now();
-                
+
+                const isIdr = containsH264Idr(data);
+
                 // 使用观看者索引快速查找（O(1) 而非遍历所有客户端）
                 const viewers = deviceKey ? deviceViewerIndex.get(deviceKey) : null;
                 let viewerCount = 0;
                 if (viewers && viewers.size > 0) {
                     for (const viewerWs of viewers) {
                         if (viewerWs.readyState === WebSocket.OPEN) {
+                            // 每个观看者独立管理队列：慢观看者不拖累其他观看者
+                            let bp = viewerBackpressure.get(viewerWs);
+                            if (!bp) {
+                                bp = { skipping: false, lastKeyframeReqAt: 0 };
+                                viewerBackpressure.set(viewerWs, bp);
+                            }
+
+                            if (!bp.skipping && viewerWs.bufferedAmount > VIEWER_MAX_BUFFERED_AMOUNT) {
+                                bp.skipping = true;
+                                bp.lastKeyframeReqAt = Date.now();
+                                log('WARN', `[视频转发] 观看者积压 ${viewerWs.bufferedAmount} 字节，跳过普通帧等待关键帧`);
+                                requestDeviceKeyframe(foundDevice, matchedSerial || serial);
+                            }
+
+                            if (bp.skipping) {
+                                // 关键帧请求长时间未生效时回退完整重置一次（旧 scrcpy 兼容）
+                                if (Date.now() - bp.lastKeyframeReqAt > 5000) {
+                                    bp.lastKeyframeReqAt = Date.now();
+                                    log('WARN', '[视频转发] 同步帧请求未生效，回退完整重置');
+                                    requestDeviceKeyframe(foundDevice, matchedSerial || serial, true);
+                                }
+                                if (isIdr) {
+                                    // 从新关键帧恢复发送
+                                    bp.skipping = false;
+                                } else {
+                                    continue;
+                                }
+                            }
+
                             if (viewerWs.bufferedAmount <= MAX_WS_BUFFERED_AMOUNT) {
                                 viewerWs.send(data, { binary: true, compress: false });
                                 viewerCount++;
@@ -677,7 +756,7 @@ function continueWebSocketConnection(ws, req, params, clientType, user) {
                 } else {
                     // 降级：索引中找不到时遍历（兼容旧匹配方式）
                     webClients.forEach((client) => {
-                        const matchDevice = client.currentDevice === `${foundConsoleId}:${matchedSerial}` || 
+                        const matchDevice = client.currentDevice === `${foundConsoleId}:${matchedSerial}` ||
                                            client.currentDevice === `${foundConsoleId}:${serial}` ||
                                            client.currentDevice === matchedSerial ||
                                            client.currentDevice === serial;
@@ -689,7 +768,7 @@ function continueWebSocketConnection(ws, req, params, clientType, user) {
                         }
                     });
                 }
-                
+
                 // 更新观看者数量
                 foundDevice.viewerCount = viewerCount;
             }
@@ -917,11 +996,29 @@ function handleConsoleMessage(consoleId, msg) {
             break;
             
         case 'startStreaming':
-            // 控制台准备开始推流
-            const device = consoleClient.devices.get(msg.serial);
-            if (device) {
-                device.status = 'starting';
-                log('INFO', `[控制台] ${consoleId} 开始推流设备 ${msg.serial}`);
+            // 控制台已启动推流（携带实际生效的画质档位与参数）
+            const streamDevice = consoleClient.devices.get(msg.serial);
+            if (streamDevice) {
+                streamDevice.status = 'streaming';
+                streamDevice.streamingProfile = typeof msg.profile === 'string' ? msg.profile : undefined;
+                streamDevice.streamingArgs = typeof msg.args === 'string' ? msg.args : undefined;
+                streamDevice.keyframeMode = msg.keyframeMode === 'reset' ? 'reset' : 'sync';
+                log('INFO', `[控制台] ${consoleId} 开始推流设备 ${msg.serial} (档位: ${streamDevice.streamingProfile || 'unknown'})`);
+
+                // 通知正在观看该设备的 Web 客户端实际生效参数
+                const targetDeviceId = `${consoleId}:${msg.serial}`;
+                webClients.forEach((client) => {
+                    if (client.currentDevice === targetDeviceId) {
+                        sendWsJson(client.ws, {
+                            type: 'streamingStarted',
+                            deviceId: targetDeviceId,
+                            serial: msg.serial,
+                            profile: streamDevice.streamingProfile,
+                            args: streamDevice.streamingArgs,
+                            keyframeMode: streamDevice.keyframeMode
+                        });
+                    }
+                });
             }
             break;
             
@@ -1100,9 +1197,11 @@ function handleWebMessage(clientId, msg) {
             if (consoleClient.ws.readyState === WebSocket.OPEN) {
                 sendWsJson(consoleClient.ws, {
                     type: 'startDevice',
-                    serial: serial
+                    serial: serial,
+                    // 画质档位（已在白名单内校验；未传或非法时由控制台回退默认档）
+                    profile: normalizeVideoProfile(msg.profile)
                 });
-                log('INFO', `[Web客户端] 已发送startDevice消息到控制台: ${consoleId}`);
+                log('INFO', `[Web客户端] 已发送startDevice消息到控制台: ${consoleId} (profile=${normalizeVideoProfile(msg.profile) || 'default'})`);
             } else {
                 webClient.currentDevice = null;
                 removeViewerFromIndex(routedDeviceId, webClient.ws);

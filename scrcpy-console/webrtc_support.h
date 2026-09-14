@@ -60,6 +60,20 @@ bool webrtc_add_ice_candidate(const char* device_id, const char* candidate);
 // 发送视频数据
 bool webrtc_send_video(const char* device_id, const uint8_t* data, size_t len);
 
+// 设置 DataChannel 发送水位预算（字节；0 表示不限制）。
+// 按档位码率 × 排队预算估算，例如 4Mbps × 100ms / 8 ≈ 50KB
+void webrtc_set_send_budget(size_t bytes);
+
+// 查询 DataChannel 发送排队字节数（失败返回 -1）
+int webrtc_get_buffered_amount(const char* device_id);
+
+// 查询已发送/因水位或失败而丢弃的帧计数
+uint64_t webrtc_get_frames_sent(const char* device_id);
+uint64_t webrtc_get_frames_dropped(const char* device_id);
+
+// 通过 DataChannel 发送文本消息（如指标上报 JSON）
+bool webrtc_send_text(const char* device_id, const char* text);
+
 // 关闭 WebRTC 连接
 void webrtc_close(const char* device_id);
 

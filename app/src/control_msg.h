@@ -43,6 +43,8 @@ enum sc_control_msg_type {
     SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS,
     SC_CONTROL_MSG_TYPE_START_APP,
     SC_CONTROL_MSG_TYPE_RESET_VIDEO,
+    // 必须与 server 端 ControlMessage.TYPE_REQUEST_SYNC_FRAME (18) 保持一致
+    SC_CONTROL_MSG_TYPE_REQUEST_SYNC_FRAME,
 };
 
 enum sc_copy_key {
