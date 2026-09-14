@@ -1268,6 +1268,7 @@ function createDeviceListItem(device) {
     } else {
         thumbnail.style.display = 'none';
         const placeholder = document.createElement('span');
+        placeholder.className = 'thumbnail-placeholder';
         placeholder.textContent = '无预览';
         placeholder.style.cssText = 'color: #666; font-size: 12px;';
         thumbnailContainer.appendChild(placeholder);
@@ -1386,18 +1387,28 @@ function updateSingleDevice(device) {
     if (!li) return;
     
     // 更新缩略图
-    const thumbnail = li.querySelector('.device-thumbnail img');
-    if (device.thumbnail) {
-        console.log(`[DEVICE] 设备 ${device.serial} 有缩略图数据，长度: ${device.thumbnail.length}`);
-        thumbnail.src = `data:image/jpeg;base64,${device.thumbnail}`;
-    } else {
-        console.log(`[DEVICE] 设备 ${device.serial} 没有缩略图数据`);
-        // 创建一个占位符文本
-        thumbnail.style.display = 'none';
-        const placeholder = document.createElement('span');
-        placeholder.textContent = '无预览';
-        placeholder.style.cssText = 'color: #666; font-size: 12px;';
-        li.querySelector('.device-thumbnail').appendChild(placeholder);
+    const thumbnailContainer = li.querySelector('.device-thumbnail');
+    const thumbnail = thumbnailContainer ? thumbnailContainer.querySelector('img') : null;
+    if (thumbnailContainer && thumbnail) {
+        // 先移除旧的占位符（避免多次累积）
+        const oldPlaceholder = thumbnailContainer.querySelector('.thumbnail-placeholder');
+        if (oldPlaceholder) {
+            oldPlaceholder.remove();
+        }
+
+        if (device.thumbnail) {
+            console.log(`[DEVICE] 设备 ${device.serial} 有缩略图数据，长度: ${device.thumbnail.length}`);
+            thumbnail.src = `data:image/jpeg;base64,${device.thumbnail}`;
+            thumbnail.style.display = 'block';
+        } else {
+            console.log(`[DEVICE] 设备 ${device.serial} 没有缩略图数据`);
+            thumbnail.style.display = 'none';
+            const placeholder = document.createElement('span');
+            placeholder.className = 'thumbnail-placeholder';
+            placeholder.textContent = '无预览';
+            placeholder.style.cssText = 'color: #666; font-size: 12px;';
+            thumbnailContainer.appendChild(placeholder);
+        }
     }
     
     // 按需求：deviceUpdate 仅更新设备状态/缩略图，不更新设备名称

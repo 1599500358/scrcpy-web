@@ -8,8 +8,35 @@ const crypto = require('crypto');
 const session = require('express-session');
 const bodyParser = require('body-parser');
 const AuthManager = require('./auth-manager');
+const googleAuth = require('./google-auth');
 const WebRTC = require('./webrtc-signaling');
 const TurnServer = require('./turn-server');
+
+// 加载 relay-server/.env（不覆盖已存在的环境变量），供 SESSION_SECRET /
+// GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / ADMIN_EMAIL / GOOGLE_REDIRECT_URI 等使用
+function loadEnvFile(envPath) {
+    try {
+        const content = fs.readFileSync(envPath, 'utf8');
+        for (const line of content.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eq = trimmed.indexOf('=');
+            if (eq <= 0) continue;
+            const key = trimmed.slice(0, eq).trim();
+            let value = trimmed.slice(eq + 1).trim();
+            if ((value.startsWith('"') && value.endsWith('"')) ||
+                (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.slice(1, -1);
+            }
+            if (process.env[key] === undefined) {
+                process.env[key] = value;
+            }
+        }
+    } catch (e) {
+        // .env 不存在或不可读时静默跳过，外部环境变量仍然生效
+    }
+}
+loadEnvFile(path.join(__dirname, '.env'));
 
 // WebRTC 配置
 const WEBRTC_ENABLED = process.env.WEBRTC_ENABLED !== 'false'; // 默认启用
@@ -19,6 +46,14 @@ const TURN_PORT = process.env.TURN_PORT || '3478';
 const TURN_USERNAME = process.env.TURN_USERNAME || '';
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || '';
 const TURN_SECRET = process.env.TURN_SECRET || ''; // 用于生成临时凭证
+
+// 控制台认证 Token（可选配置，未配置时输出提示）
+const CONSOLE_TOKEN = process.env.CONSOLE_TOKEN || '';
+if (CONSOLE_TOKEN) {
+    log('INFO', '[安全] 已启用控制台连接 Token 鉴权');
+} else {
+    log('WARN', '[安全] 未配置 CONSOLE_TOKEN，控制台连接将使用免密兼容模式（生产环境强烈建议配置）');
+}
 
 // 日志级别控制
 const LOG_LEVELS = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
@@ -237,16 +272,25 @@ const sessionConfig = authManager.getSessionConfig();
 // 根据是否启用HTTPS动态设置cookie安全属性
 sessionConfig.cookie.secure = ENABLE_HTTPS;
 sessionConfig.cookie.httpOnly = true; // 防止XSS窃取session cookie
+sessionConfig.cookie.sameSite = sessionConfig.cookie.sameSite || 'lax'; // 防止CSRF
 sessionConfig.name = 'scrcpy.sid'; // 设置会话cookie名称
-sessionConfig.saveUninitialized = true; // 确保会话被保存
+sessionConfig.saveUninitialized = false;
 sessionConfig.resave = false;
+
+// 检查是否为已知的泄露或占位密钥
+const LEAKED_SECRETS = new Set([
+    '4f8eb39eed2b63e63ba18b31c4334f83b7a502b95e9812511e14cd3e449945aa',
+    'change-this-in-production',
+    'change-this'
+]);
+
 // session secret 优先从环境变量读取
 if (process.env.SESSION_SECRET) {
     sessionConfig.secret = process.env.SESSION_SECRET;
-} else if (!sessionConfig.secret || sessionConfig.secret.includes('change-this')) {
-    // 没有设置环境变量且配置文件使用默认值时，自动生成随机密钥
+} else if (!sessionConfig.secret || LEAKED_SECRETS.has(sessionConfig.secret) || sessionConfig.secret.includes('change-this')) {
+    // 未提供安全环境变量时，自动生成256位高强度随机安全密钥
     sessionConfig.secret = crypto.randomBytes(32).toString('hex');
-    log('WARN', '[安全] 使用自动生成的session secret，建议设置 SESSION_SECRET 环境变量');
+    log('WARN', '[安全] 未检测到安全的 SESSION_SECRET，已自动生成随机密钥');
 }
 const sessionMiddleware = session(sessionConfig);
 app.use(sessionMiddleware);
@@ -282,7 +326,8 @@ app.post('/api/login', async (req, res) => {
     }
     
     try {
-        const result = await authManager.authenticate(username, password);
+        const clientIp = req.ip || req.connection?.remoteAddress || '';
+        const result = await authManager.authenticate(username, password, clientIp);
         if (result.success) {
             req.session.user = result.user;
             req.session.loginTime = new Date().toISOString();
@@ -321,6 +366,101 @@ app.post('/api/logout', (req, res) => {
 // 获取当前用户信息
 app.get('/api/user', authManager.requireAuth, (req, res) => {
     res.json({ user: req.session.user });
+});
+
+// ============ Google OAuth 登录（移植自 photo 项目，同一管理员白名单） ============
+
+// 从当前请求推导回调地址（生产环境建议用 GOOGLE_REDIRECT_URI 显式指定）
+function deriveGoogleRedirectUri(req) {
+    return `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
+}
+
+// 登录页查询 Google 登录是否可用（决定是否展示按钮）
+app.get('/api/auth/google/status', (req, res) => {
+    res.json({ enabled: googleAuth.isGoogleOAuthConfigured() });
+});
+
+// 发起 Google 登录：生成 state + PKCE 暂存到会话后跳转 Google
+app.get('/api/auth/google', (req, res) => {
+    const cfg = googleAuth.getGoogleOAuthConfig();
+    if (!googleAuth.isGoogleOAuthConfigured()) {
+        return res.redirect('/login?error=' + encodeURIComponent('Google 登录未配置：缺少 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / ADMIN_EMAIL'));
+    }
+
+    const state = googleAuth.generateState();
+    const { verifier, challenge } = googleAuth.generatePkcePair();
+    // state/PKCE 存入当前会话（10 分钟有效），回调时比对
+    req.session.oauth = { state, verifier, createdAt: Date.now() };
+
+    res.redirect(googleAuth.getGoogleAuthUrl({
+        clientId: cfg.clientId,
+        redirectUri: cfg.redirectUri || deriveGoogleRedirectUri(req),
+        state,
+        codeChallenge: challenge
+    }));
+});
+
+// Google 回调：校验 state → 兑换 token → 拉取用户信息 → 白名单校验 → 写入会话
+app.get('/api/auth/google/callback', async (req, res) => {
+    const cfg = googleAuth.getGoogleOAuthConfig();
+    const oauth = req.session && req.session.oauth;
+    delete req.session.oauth;
+
+    const fail = (message) => res.redirect('/login?error=' + encodeURIComponent(message));
+
+    if (!googleAuth.isGoogleOAuthConfigured()) {
+        return fail('Google 登录未配置');
+    }
+
+    const { code, state, error: oauthError } = req.query;
+    if (oauthError) {
+        log('WARN', '[Google登录] 用户取消或授权失败:', oauthError);
+        return fail('Google 授权被取消或失败，请重试');
+    }
+
+    // state 比对（CSRF 防护）+ 有效期校验
+    const OAUTH_FLOW_TTL = 10 * 60 * 1000;
+    if (!code || !state || !oauth || !oauth.state ||
+        !googleAuth.timingSafeEqualStr(state, oauth.state) ||
+        !oauth.createdAt || Date.now() - oauth.createdAt > OAUTH_FLOW_TTL) {
+        log('WARN', '[Google登录] state 校验失败或流程已过期');
+        return fail('会话状态校验失败或已过期，请重新发起登录');
+    }
+
+    try {
+        const tokenRes = await googleAuth.exchangeGoogleCode({
+            code,
+            clientId: cfg.clientId,
+            clientSecret: cfg.clientSecret,
+            redirectUri: cfg.redirectUri || deriveGoogleRedirectUri(req),
+            codeVerifier: oauth.verifier
+        });
+        const userInfo = await googleAuth.getGoogleUserInfo(tokenRes.access_token);
+        const email = (userInfo.email || '').toLowerCase();
+
+        // 严格白名单：与 photo 项目一致，仅允许单一管理员邮箱；
+        // 拒绝时不提示期望的账号，防止账号枚举
+        if (!email || email !== cfg.adminEmail) {
+            log('WARN', `[Google登录] 非白名单账号被拒绝: ${email || '(无邮箱)'}`);
+            return fail('当前 Google 账号未获得此系统的授权');
+        }
+
+        req.session.user = {
+            username: email,
+            role: 'admin',
+            authProvider: 'google',
+            name: userInfo.name || email.split('@')[0],
+            avatar: userInfo.picture || ''
+        };
+        req.session.loginTime = new Date().toISOString();
+        req.session.cookie.maxAge = 7 * 24 * 60 * 60 * 1000; // Google 会话保持 7 天（与 photo 一致）
+
+        log('INFO', `[Google登录] 登录成功: ${email}`);
+        res.redirect('/');
+    } catch (err) {
+        log('ERROR', '[Google登录] 回调处理失败:', err.message);
+        fail('登录流程出现问题，请稍后重试');
+    }
 });
 
 // API: 获取 WebRTC 配置（包括 TURN 凭证）
@@ -461,7 +601,19 @@ function getConsolePriority(consoleClient) {
     return (isOpen ? 1e15 : 0) + connectedAtMs;
 }
 
-function findDeviceBySerial(serial) {
+function findDeviceBySerial(serial, preferredConsoleId = null) {
+    // 优先匹配指定控制台
+    if (preferredConsoleId && consoleClients.has(preferredConsoleId)) {
+        const consoleClient = consoleClients.get(preferredConsoleId);
+        if (consoleClient.devices.has(serial)) {
+            return {
+                device: consoleClient.devices.get(serial),
+                consoleId: preferredConsoleId,
+                serial: serial
+            };
+        }
+    }
+
     let bestMatch = null;
 
     function considerCandidate(consoleClient, consoleId, deviceSerial, device) {
@@ -502,47 +654,43 @@ function findDeviceBySerial(serial) {
 }
 
 function buildWebDeviceList() {
-    const bySerial = new Map(); // serial -> { device, consoleId, priority }
+    const allDevices = [];
 
     consoleClients.forEach((consoleClient, consoleId) => {
+        if (!consoleClient.ws || consoleClient.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
         consoleClient.devices.forEach((device, serial) => {
-            const priority = getConsolePriority(consoleClient);
-            const existing = bySerial.get(serial);
-            if (!existing || priority >= existing.priority) {
-                bySerial.set(serial, { device, consoleId, priority });
+            const deviceId = `${consoleId}:${serial}`;
+            const deviceInfo = {
+                id: deviceId,
+                serial: device.serial || serial,
+                model: device.model,
+                state: device.state,
+                status: device.status,
+                consoleId
+            };
+
+            if (device.thumbnail) {
+                deviceInfo.thumbnail = device.thumbnail;
+                log('DEBUG', `[WS] 发送设备 ${deviceId} 缩略图数据，长度: ${device.thumbnail.length}`);
             }
+
+            if (deviceAliases.has(deviceId)) {
+                deviceInfo.customName = deviceAliases.get(deviceId);
+            } else if (deviceAliases.has(serial)) {
+                deviceInfo.customName = deviceAliases.get(serial);
+            } else if (device.customName) {
+                deviceInfo.customName = device.customName;
+            }
+
+            const groupName = deviceGroups.get(deviceId) || deviceGroups.get(serial) || device.groupName;
+            if (groupName && String(groupName).trim()) {
+                deviceInfo.groupName = String(groupName).trim();
+            }
+
+            allDevices.push(deviceInfo);
         });
-    });
-
-    const allDevices = [];
-    bySerial.forEach((entry, serial) => {
-        const { device, consoleId } = entry;
-        const deviceInfo = {
-            id: `${consoleId}:${serial}`,
-            serial: device.serial || serial,
-            model: device.model,
-            state: device.state,
-            status: device.status,
-            consoleId
-        };
-
-        if (device.thumbnail) {
-            deviceInfo.thumbnail = device.thumbnail;
-            log('DEBUG', `[WS] 发送设备 ${serial} 缩略图数据，长度: ${device.thumbnail.length}`);
-        }
-
-        if (deviceAliases.has(serial)) {
-            deviceInfo.customName = deviceAliases.get(serial);
-        } else if (device.customName) {
-            deviceInfo.customName = device.customName;
-        }
-
-        const groupName = deviceGroups.get(serial) || device.groupName;
-        if (groupName && String(groupName).trim()) {
-            deviceInfo.groupName = String(groupName).trim();
-        }
-
-        allDevices.push(deviceInfo);
     });
 
     return allDevices;
@@ -567,10 +715,37 @@ function sendWsJson(ws, payload) {
     }
 }
 
+// 检查 WebSocket 升级请求的 Origin（防范 CSWSH 跨站劫持）
+function isAllowedWsOrigin(req) {
+    const origin = req.headers.origin;
+    if (!origin) {
+        // 非浏览器客户端（如本地 C 客户端、Node 脚本）不带 Origin，放行
+        return true;
+    }
+    const host = req.headers.host;
+    if (!host) return false;
+    try {
+        const parsedOrigin = new URL(origin);
+        // 主机名相同即同源（忽略协议是 http 还是 https，兼容反向代理）
+        if (parsedOrigin.host === host || parsedOrigin.hostname === host.split(':')[0]) {
+            return true;
+        }
+        if (process.env.ALLOWED_ORIGINS) {
+            const allowed = process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim().toLowerCase());
+            if (allowed.includes(parsedOrigin.origin.toLowerCase()) || allowed.includes(parsedOrigin.host.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
+    } catch (e) {
+        return false;
+    }
+}
+
 // WebSocket 连接处理函数（共用）
 function handleWebSocketConnection(ws, req) {
     const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
-    const clientType = params.get('type'); // 'console', 'scrcpy' 或 'web'
+    const clientType = params.get('type'); // 'console', 'scrcpy', 'control' 或 'web'
     const serial = params.get('serial');
     
     // 为 WebSocket upgrade 请求创建模拟 response 对象
@@ -585,19 +760,52 @@ function handleWebSocketConnection(ws, req) {
     
     // 检查WebSocket连接是否需要认证
     if (clientType === 'web') {
+        // 校验 Origin 防止 CSWSH
+        if (!isAllowedWsOrigin(req)) {
+            log('WARN', `[安全] 拦截跨站 WebSocket 劫持 (CSWSH): Origin=${req.headers.origin}, Host=${req.headers.host}`);
+            ws.close(1008, '跨站访问被拒绝 (CSWSH)');
+            return;
+        }
+
         // Web客户端始终需要认证
         log('INFO', `[认证] WebSocket upgrade cookies: ${req.headers.cookie || '(none)'}`);
         sessionMiddleware(req, fakeRes, () => {
             log('INFO', `[认证] session解析完成, sessionID: ${req.sessionID}, hasUser: ${!!(req.session && req.session.user)}, keys: ${req.session ? Object.keys(req.session).join(',') : 'null'}`);
             if (req.session && req.session.user) {
                 log('INFO', `[认证] WebSocket连接已授权: ${req.session.user.username}`);
-                // 继续处理WebSocket连接
                 continueWebSocketConnection(ws, req, params, clientType, req.session.user);
             } else {
                 log('WARN', `[认证] WebSocket连接被拒绝: 无效会话`);
                 ws.close(1008, '未授权访问');
             }
         });
+    } else if (clientType === 'console') {
+        // 控制台连接：若配置了 CONSOLE_TOKEN 则强制校验
+        if (CONSOLE_TOKEN) {
+            const token = params.get('token');
+            if (!token || token !== CONSOLE_TOKEN) {
+                log('WARN', `[安全] 控制台身份验证失败: Token 不匹配 (来源 IP: ${req.socket.remoteAddress})`);
+                ws.close(1008, '控制台 Token 认证失败');
+                return;
+            }
+            log('INFO', `[认证] 控制台 Token 验证通过`);
+        }
+        continueWebSocketConnection(ws, req, params, clientType, null);
+    } else if (clientType === 'control') {
+        // 控制连接：必须校验 serial 并确保对应设备已在某个控制台注册
+        const controlSerial = params.get('serial');
+        if (!controlSerial) {
+            log('WARN', '[scrcpy-control] 连接被拒绝: 缺少 serial');
+            ws.close(1008, '缺少 serial');
+            return;
+        }
+        const lookup = findDeviceBySerial(controlSerial);
+        if (!lookup.device) {
+            log('WARN', `[scrcpy-control] 连接被拒绝: 设备 ${controlSerial} 未注册`);
+            ws.close(1008, '设备未注册');
+            return;
+        }
+        continueWebSocketConnection(ws, req, params, clientType, null);
     } else if (clientType === 'scrcpy' && serial) {
         // scrcpy连接：检查是否是控制台预注册的设备
         if (pendingDeviceStreams.has(serial)) {
@@ -618,8 +826,9 @@ function handleWebSocketConnection(ws, req) {
             });
         }
     } else {
-        // 控制台连接不需要认证
-        continueWebSocketConnection(ws, req, params, clientType, null);
+        // 其他非授权类型拒绝
+        log('WARN', `[安全] 未知或未授权的连接类型: ${clientType}`);
+        ws.close(1008, '未授权访问');
     }
 }
 
@@ -875,7 +1084,8 @@ function continueWebSocketConnection(ws, req, params, clientType, user) {
         const clientId = `web_${crypto.randomUUID()}`;
         webClients.set(clientId, {
             ws,
-            currentDevice: null
+            currentDevice: null,
+            user: user || null
         });
         
         log('INFO', `[Web客户端] 已连接: ${clientId}`);
@@ -1095,6 +1305,18 @@ function handleConsoleMessage(consoleId, msg) {
     }
 }
 
+// Web 客户端控制命令频率限制（避免频繁按键引发控制台 ADB 进程泛洪）
+const webControlLastTimes = new Map();
+function isWebControlThrottled(clientId, minIntervalMs = 100) {
+    const now = Date.now();
+    const lastTime = webControlLastTimes.get(clientId) || 0;
+    if (now - lastTime < minIntervalMs) {
+        return true;
+    }
+    webControlLastTimes.set(clientId, now);
+    return false;
+}
+
 // 处理 Web 客户端消息
 function handleWebMessage(clientId, msg) {
     const webClient = webClients.get(clientId);
@@ -1122,19 +1344,21 @@ function handleWebMessage(clientId, msg) {
             const [requestedConsoleId, requestedSerial] = splitDeviceId(msg.deviceId);
             log('DEBUG', `[Web客户端] 解析设备ID: consoleId=${requestedConsoleId}, serial=${requestedSerial}`);
 
-            // 优先按 serial 解析到当前在线且最新的控制台，避免旧 consoleId 缓存导致发错目标
-            const resolved = findDeviceBySerial(requestedSerial);
             let consoleId = requestedConsoleId;
             let serial = requestedSerial;
             let consoleClient = consoleClients.get(consoleId);
             let device = consoleClient ? consoleClient.devices.get(serial) : null;
 
-            if (resolved.device && resolved.consoleId) {
-                const requestedReady = !!(consoleClient &&
-                    device &&
-                    consoleClient.ws &&
-                    consoleClient.ws.readyState === WebSocket.OPEN);
-                if (!requestedReady || resolved.consoleId !== requestedConsoleId) {
+            // 优先检查用户指定的控制台设备是否存在且在线
+            const requestedReady = !!(consoleClient &&
+                device &&
+                consoleClient.ws &&
+                consoleClient.ws.readyState === WebSocket.OPEN);
+
+            // 仅在指定控制台离线或未找到设备时，才尝试匹配其他控制台的同名设备
+            if (!requestedReady) {
+                const resolved = findDeviceBySerial(requestedSerial, requestedConsoleId);
+                if (resolved.device && resolved.consoleId) {
                     consoleId = resolved.consoleId;
                     serial = resolved.serial || requestedSerial;
                     consoleClient = consoleClients.get(consoleId);
@@ -1253,7 +1477,12 @@ function handleWebMessage(clientId, msg) {
             break;
             
         case 'control':
-            // 控制按钮（Home/Back等）
+            // 控制按钮（Home/Back等）限流防爆
+            if (isWebControlThrottled(clientId, 100)) {
+                log('DEBUG', `[限流] 客户端 ${clientId} 控制指令过于密集，已丢弃`);
+                break;
+            }
+
             if (webClient.currentDevice) {
                 const [consoleId, serial] = splitDeviceId(webClient.currentDevice);
                 
@@ -1282,12 +1511,14 @@ function handleWebMessage(clientId, msg) {
         case 'stopDevice':
             // 停止设备推流
             if (webClient.currentDevice) {
-                const [consoleId, serial] = splitDeviceId(webClient.currentDevice);
+                const currentDeviceId = webClient.currentDevice;
+                const [consoleId, serial] = splitDeviceId(currentDeviceId);
                 
-                log('INFO', `[Web客户端] ${clientId} 请求停止设备: ${serial}`);
+                log('INFO', `[Web客户端] ${clientId} 请求停止设备: ${currentDeviceId}`);
                 
-                // 从观看者索引中移除
-                removeViewerFromIndex(webClient.currentDevice, webClient.ws);
+                // 从观看者索引中移除当前客户端
+                removeViewerFromIndex(currentDeviceId, webClient.ws);
+                webClient.currentDevice = null;
                 
                 const consoleClient = consoleClients.get(consoleId);
                 if (consoleClient) {
@@ -1297,29 +1528,42 @@ function handleWebMessage(clientId, msg) {
                         device.viewerCount--;
                     }
                     
-                    // 通知控制台停止该设备
-                    if (consoleClient.ws.readyState === WebSocket.OPEN) {
-                        consoleClient.ws.send(JSON.stringify({
-                            type: 'stopDevice',
-                            serial: serial
-                        }));
-                        log('INFO', `[Web客户端] 已转发停止请求到控制台: ${consoleId}`);
+                    // 核心修复：检查当前设备是否还有其他在线观看者
+                    const viewers = deviceViewerIndex.get(currentDeviceId);
+                    const activeViewers = viewers ? viewers.size : 0;
+                    
+                    if (activeViewers === 0 && (!device || device.viewerCount <= 0)) {
+                        if (device) device.viewerCount = 0;
+                        if (consoleClient.ws && consoleClient.ws.readyState === WebSocket.OPEN) {
+                            consoleClient.ws.send(JSON.stringify({
+                                type: 'stopDevice',
+                                serial: serial
+                            }));
+                            log('INFO', `[Web客户端] 设备 ${currentDeviceId} 已无任何观看者，已下发停止请求到控制台: ${consoleId}`);
+                        }
+                    } else {
+                        log('INFO', `[Web客户端] 设备 ${currentDeviceId} 仍有 ${activeViewers} 位观看者，保持推流`);
                     }
                 }
-                
-                // 清除客户端的当前设备
-                webClient.currentDevice = null;
             }
             break;
             
         case 'updateDeviceName':
-            // 更新设备名称
+            // 更新设备名称（RBAC: 仅管理员可操作）
             if (msg.deviceId && msg.customName) {
+                if (webClient.user && webClient.user.role && webClient.user.role !== 'admin') {
+                    sendWsJson(webClient.ws, {
+                        type: 'error',
+                        message: '权限不足：仅管理员可以修改设备名称'
+                    });
+                    break;
+                }
                 const [consoleId, serial] = splitDeviceId(msg.deviceId);
                 
-                log('INFO', `[Web客户端] ${clientId} 请求更新设备名称: ${serial} -> ${msg.customName}`);
+                log('INFO', `[Web客户端] ${clientId} 请求更新设备名称: ${msg.deviceId} -> ${msg.customName}`);
                 
-                // 直接在服务端保存设备别名
+                // 保存全局设备别名（同时支持 deviceId 与 serial 索引）
+                deviceAliases.set(msg.deviceId, msg.customName);
                 deviceAliases.set(serial, msg.customName);
                 saveDeviceAliases();
                 
@@ -1338,17 +1582,26 @@ function handleWebMessage(clientId, msg) {
             break;
 
         case 'updateDeviceGroup':
-            // 更新设备分组
+            // 更新设备分组（RBAC: 仅管理员可操作）
             if (msg.deviceId && typeof msg.groupName === 'string') {
+                if (webClient.user && webClient.user.role && webClient.user.role !== 'admin') {
+                    sendWsJson(webClient.ws, {
+                        type: 'error',
+                        message: '权限不足：仅管理员可以修改设备分组'
+                    });
+                    break;
+                }
                 const [consoleId, serial] = splitDeviceId(msg.deviceId);
                 const normalizedGroupName = msg.groupName.trim().slice(0, 40);
 
                 if (normalizedGroupName) {
+                    deviceGroups.set(msg.deviceId, normalizedGroupName);
                     deviceGroups.set(serial, normalizedGroupName);
-                    log('INFO', `[Web客户端] ${clientId} 更新设备分组: ${serial} -> ${normalizedGroupName}`);
+                    log('INFO', `[Web客户端] ${clientId} 更新设备分组: ${msg.deviceId} -> ${normalizedGroupName}`);
                 } else {
+                    deviceGroups.delete(msg.deviceId);
                     deviceGroups.delete(serial);
-                    log('INFO', `[Web客户端] ${clientId} 清除设备分组: ${serial}`);
+                    log('INFO', `[Web客户端] ${clientId} 清除设备分组: ${msg.deviceId}`);
                 }
                 saveDeviceGroups();
 
@@ -1461,9 +1714,20 @@ function broadcastDeviceListToWeb() {
 
 // 广播单个设备更新到所有 Web 客户端
 function broadcastDeviceUpdateToWeb(device) {
+    const safeDevice = {
+        id: device.id || `${device.consoleId}:${device.serial}`,
+        serial: device.serial,
+        model: device.model,
+        state: device.state,
+        status: device.status,
+        consoleId: device.consoleId,
+        customName: device.customName,
+        groupName: device.groupName,
+        thumbnail: device.thumbnail
+    };
     const message = JSON.stringify({
         type: 'deviceUpdate',
-        device: device
+        device: safeDevice
     });
     webClients.forEach((client) => {
         if (client.ws.readyState === WebSocket.OPEN) {
@@ -1550,11 +1814,37 @@ setInterval(() => {
     });
 }, 60000); // 每分钟检查一次
 
-log('INFO', `[空闲检测] 已启动，超时时间: ${IDLE_TIMEOUT / 1000}秒`);
+// WebSocket 应用层心跳保活检测（每 30 秒主动发送 Ping 帧）
+const heartbeatInterval = setInterval(() => {
+    // 检查控制台连接活性
+    consoleClients.forEach((client, id) => {
+        if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+            try {
+                client.ws.ping();
+            } catch (e) {
+                log('WARN', `[心跳] 控制台 ${id} Ping 发送失败:`, e.message);
+            }
+        }
+    });
+
+    // 检查 Web 客户端活性
+    webClients.forEach((client, id) => {
+        if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+            try {
+                client.ws.ping();
+            } catch (e) {
+                log('WARN', `[心跳] Web客户端 ${id} Ping 发送失败:`, e.message);
+            }
+        }
+    });
+}, 30000);
 
 // Graceful shutdown：优雅关闭服务器
 function gracefulShutdown(signal) {
     log('INFO', `[关闭] 收到 ${signal} 信号，正在优雅关闭...`);
+
+    // 停止心跳检测
+    clearInterval(heartbeatInterval);
 
     // 停止 TURN 服务器
     TurnServer.stopTurnServer();

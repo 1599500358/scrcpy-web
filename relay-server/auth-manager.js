@@ -36,62 +36,80 @@ class AuthManager {
         return bcrypt.compare(password, hash);
     }
 
-    isLockedOut(username) {
-        const attempts = this.loginAttempts.get(username);
+    cleanupExpiredAttempts() {
+        const now = Date.now();
+        const lockoutTime = this.config.security?.lockoutTime || 900000;
+        for (const [key, attempts] of this.loginAttempts.entries()) {
+            if (now - attempts.lastAttempt >= lockoutTime) {
+                this.loginAttempts.delete(key);
+            }
+        }
+    }
+
+    isLockedOut(key) {
+        this.cleanupExpiredAttempts();
+        const attempts = this.loginAttempts.get(key);
         if (!attempts) return false;
         
         const { count, lastAttempt } = attempts;
-        const lockoutTime = this.config.security.lockoutTime || 900000; // 15 minutes
-        const maxAttempts = this.config.security.maxLoginAttempts || 5;
+        const lockoutTime = this.config.security?.lockoutTime || 900000; // 15 minutes
+        const maxAttempts = this.config.security?.maxLoginAttempts || 5;
         
         if (count >= maxAttempts && Date.now() - lastAttempt < lockoutTime) {
             return true;
         }
         
         if (Date.now() - lastAttempt >= lockoutTime) {
-            this.loginAttempts.delete(username);
+            this.loginAttempts.delete(key);
         }
         
         return false;
     }
 
-    recordLoginAttempt(username, success) {
+    recordLoginAttempt(key, success) {
         if (success) {
-            this.loginAttempts.delete(username);
+            this.loginAttempts.delete(key);
             return;
         }
         
-        const attempts = this.loginAttempts.get(username) || { count: 0, lastAttempt: 0 };
+        const attempts = this.loginAttempts.get(key) || { count: 0, lastAttempt: 0 };
         attempts.count++;
         attempts.lastAttempt = Date.now();
-        this.loginAttempts.set(username, attempts);
+        this.loginAttempts.set(key, attempts);
     }
 
-    async authenticate(username, password) {
-        if (this.isLockedOut(username)) {
-            return { success: false, message: '账户已锁定，请15分钟后再试' };
+    async authenticate(username, password, clientIp = '') {
+        const attemptKey = clientIp ? `${clientIp}:${username}` : username;
+        if (this.isLockedOut(attemptKey)) {
+            return { success: false, message: '账户在此网络环境下已锁定，请15分钟后再试' };
         }
 
         const user = this.config.users.find(u => u.username === username);
         if (!user) {
-            this.recordLoginAttempt(username, false);
+            this.recordLoginAttempt(attemptKey, false);
             return { success: false, message: '用户名或密码错误' };
         }
 
         const isValid = await this.comparePassword(password, user.passwordHash);
         if (!isValid) {
-            this.recordLoginAttempt(username, false);
+            this.recordLoginAttempt(attemptKey, false);
             return { success: false, message: '用户名或密码错误' };
         }
 
-        this.recordLoginAttempt(username, true);
+        this.recordLoginAttempt(attemptKey, true);
         return { 
             success: true, 
             user: { 
                 username: user.username, 
-                role: user.role 
+                role: user.role || 'user'
             } 
         };
+    }
+
+    hasRole(user, requiredRole) {
+        if (!user) return false;
+        if (user.role === 'admin') return true;
+        return user.role === requiredRole;
     }
 
     requireAuth(req, res, next) {
