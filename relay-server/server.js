@@ -268,8 +268,9 @@ function saveDeviceGroups() {
 loadDeviceGroups();
 
 // 配置会话中间件
-const sessionConfig = authManager.getSessionConfig();
+const sessionConfig = authManager.getSessionConfig() || {};
 // 根据是否启用HTTPS动态设置cookie安全属性
+sessionConfig.cookie = sessionConfig.cookie || {};
 sessionConfig.cookie.secure = ENABLE_HTTPS;
 sessionConfig.cookie.httpOnly = true; // 防止XSS窃取session cookie
 sessionConfig.cookie.sameSite = sessionConfig.cookie.sameSite || 'lax'; // 防止CSRF
