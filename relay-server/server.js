@@ -47,14 +47,6 @@ const TURN_USERNAME = process.env.TURN_USERNAME || '';
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || '';
 const TURN_SECRET = process.env.TURN_SECRET || ''; // 用于生成临时凭证
 
-// 控制台认证 Token（可选配置，未配置时输出提示）
-const CONSOLE_TOKEN = process.env.CONSOLE_TOKEN || '';
-if (CONSOLE_TOKEN) {
-    log('INFO', '[安全] 已启用控制台连接 Token 鉴权');
-} else {
-    log('WARN', '[安全] 未配置 CONSOLE_TOKEN，控制台连接将使用免密兼容模式（生产环境强烈建议配置）');
-}
-
 // 日志级别控制
 const LOG_LEVELS = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
 const CURRENT_LOG_LEVEL = LOG_LEVELS[process.env.LOG_LEVEL || 'INFO'];
@@ -65,6 +57,14 @@ function log(level, ...args) {
         else if (level === 'WARN') console.warn(prefix, ...args);
         else console.log(prefix, ...args);
     }
+}
+
+// 控制台认证 Token（可选配置，未配置时输出提示）
+const CONSOLE_TOKEN = process.env.CONSOLE_TOKEN || '';
+if (CONSOLE_TOKEN) {
+    log('INFO', '[安全] 已启用控制台连接 Token 鉴权');
+} else {
+    log('WARN', '[安全] 未配置 CONSOLE_TOKEN，控制台连接将使用免密兼容模式（生产环境强烈建议配置）');
 }
 
 const app = express();
@@ -697,11 +697,12 @@ function buildWebDeviceList() {
 }
 
 // 辅助函数：拆分设备 ID（支持带端口的 IP 地址）
-// 例："console_xxx:192.168.0.6:39743" -> ["console_xxx", "192.168.0.6:39743"]
 function splitDeviceId(deviceId) {
+    if (!deviceId) return ['', ''];
     const colonIndex = deviceId.indexOf(':');
     if (colonIndex === -1) {
-        return [deviceId, ''];
+        // 无冒号时表示仅传入了设备 serial（向后兼容旧前端）
+        return ['', deviceId];
     }
     return [
         deviceId.substring(0, colonIndex),

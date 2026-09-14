@@ -135,6 +135,7 @@ Device devices[MAX_DEVICES];
 int device_count = 0;
 bool running = true;
 char server_url[256] = "localhost:8080";
+char console_token[256] = {0};
 static volatile LONG g_start_device_in_progress = 0;
 
 // 添加缩略图更新标志和线程相关变量
@@ -253,12 +254,23 @@ int main(int argc, char* argv[]) {
     
     print_banner();
 
-    // 解析命令行参数
+    // 解析命令行参数及环境变量
     if (argc > 1) {
         strncpy(server_url, argv[1], sizeof(server_url) - 1);
     }
+    if (argc > 2) {
+        strncpy(console_token, argv[2], sizeof(console_token) - 1);
+    } else {
+        const char* env_token = getenv("CONSOLE_TOKEN");
+        if (env_token && env_token[0]) {
+            strncpy(console_token, env_token, sizeof(console_token) - 1);
+        }
+    }
 
     print_log("INFO", "服务器地址: %s", server_url);
+    if (console_token[0]) {
+        print_log("INFO", "已加载控制台安全 Token 认证凭据");
+    }
 
     // 初始化 Winsock（必须在任何网络操作之前）
     if (!init_winsock()) {
@@ -461,15 +473,27 @@ bool connect_to_server() {
     
     // 发送 WebSocket 握手
     char handshake[1024];
-    sprintf(handshake,
-        "GET /?type=console HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n",
-        host);
+    if (console_token[0]) {
+        snprintf(handshake, sizeof(handshake),
+            "GET /?type=console&token=%s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n",
+            console_token, host);
+    } else {
+        snprintf(handshake, sizeof(handshake),
+            "GET /?type=console HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n",
+            host);
+    }
     
     send(ws_socket, handshake, strlen(handshake), 0);
     
@@ -1297,9 +1321,12 @@ void handle_server_message(const char* message) {
             char* id_end = strchr(id_start, '"');
             if (id_end) {
                 int len = id_end - id_start;
-                strncpy(client_id, id_start, len);
-                client_id[len] = '\0';
-                print_log("SUCCESS", "客户端 ID: %s", client_id);
+                if (len >= (int)sizeof(client_id)) len = sizeof(client_id) - 1;
+                if (len > 0) {
+                    strncpy(client_id, id_start, len);
+                    client_id[len] = '\0';
+                    print_log("SUCCESS", "客户端 ID: %s", client_id);
+                }
             }
         }
     } else if (strstr(message, "\"type\":\"prepareStreamResponse\"")) {
@@ -1313,9 +1340,12 @@ void handle_server_message(const char* message) {
             if (serial_end) {
                 char serial[256];
                 int len = serial_end - serial_start;
-                strncpy(serial, serial_start, len);
-                serial[len] = '\0';
-                print_log("SUCCESS", "设备推流预注册成功: %s", serial);
+                if (len >= (int)sizeof(serial)) len = sizeof(serial) - 1;
+                if (len > 0) {
+                    strncpy(serial, serial_start, len);
+                    serial[len] = '\0';
+                    print_log("SUCCESS", "设备推流预注册成功: %s", serial);
+                }
             }
         }
     } else if (strstr(message, "\"type\":\"control\"")) {
@@ -1333,6 +1363,10 @@ void handle_server_message(const char* message) {
                 char serial[256], action[64];
                 int serial_len = serial_end - serial_start;
                 int action_len = action_end - action_start;
+                if (serial_len >= (int)sizeof(serial)) serial_len = sizeof(serial) - 1;
+                if (action_len >= (int)sizeof(action)) action_len = sizeof(action) - 1;
+                if (serial_len < 0) serial_len = 0;
+                if (action_len < 0) action_len = 0;
                 
                 strncpy(serial, serial_start, serial_len);
                 serial[serial_len] = '\0';
@@ -1361,6 +1395,8 @@ void handle_server_message(const char* message) {
                         
                         char touchType[16];
                         int touch_len = touchType_end - touchType_start;
+                        if (touch_len >= (int)sizeof(touchType)) touch_len = sizeof(touchType) - 1;
+                        if (touch_len < 0) touch_len = 0;
                         strncpy(touchType, touchType_start, touch_len);
                         touchType[touch_len] = '\0';
                         
@@ -1409,6 +1445,14 @@ void handle_server_message(const char* message) {
                     }
                     
                     if (keycode) {
+                        static DWORD s_last_key_time = 0;
+                        DWORD now = GetTickCount();
+                        if (now - s_last_key_time < 50) {
+                            print_log("WARNING", "按键指令频率过高，已跳过: %s", action);
+                            return;
+                        }
+                        s_last_key_time = now;
+
                         if (!is_valid_serial(serial)) {
                             print_log("ERROR", "无效的设备序列号: %s", serial);
                         } else {
@@ -1436,6 +1480,8 @@ void handle_server_message(const char* message) {
             if (serial_end) {
                 char serial[256];
                 int len = serial_end - serial_start;
+                if (len >= (int)sizeof(serial)) len = sizeof(serial) - 1;
+                if (len < 0) len = 0;
                 strncpy(serial, serial_start, len);
                 serial[len] = '\0';
                 
