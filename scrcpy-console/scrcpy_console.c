@@ -144,6 +144,8 @@ DWORD last_thumbnail_update = 0;
 const DWORD THUMBNAIL_UPDATE_INTERVAL = 30000; // 30秒更新间隔
 HANDLE thumbnail_thread = NULL;
 CRITICAL_SECTION thumbnail_cs; // 用于线程同步
+CRITICAL_SECTION devices_cs;   // 保护全局 devices 数组及 device_count
+CRITICAL_SECTION ws_send_cs;   // 保证 WebSocket 发送的原子性
 
 // ADB 路径缓存（只查找一次）
 char cached_adb_path[512] = {0};
@@ -162,6 +164,9 @@ bool send_websocket_message(const char* message);
 bool receive_websocket_message(char* buffer, int buffer_size);
 int execute_adb_command(const char* command, char* output, int output_size);
 int scan_adb_devices();
+bool refresh_adb_devices();
+bool check_device_list_changed(const Device* new_list, int new_count);
+void send_device_update_msg(int device_index);
 void send_device_list();
 void send_device_list_async();
 unsigned __stdcall thumbnail_update_thread(void* param); // 缩略图更新线程函数
@@ -187,14 +192,31 @@ void send_updated_device_list();
 void report_start_device_failed(const char* serial, const char* reason, const char* message);
 bool rotate_device_via_adb(const char* serial);
 
-// JSON 简单构建（实际项目建议使用 cJSON 库）
+// JSON 规范构建（符合 RFC 8259，转义引号、反斜杠及控制字符）
 void json_escape_string(const char* input, char* output, int output_size) {
+    if (!input || !output || output_size <= 0) return;
     int j = 0;
-    for (int i = 0; input[i] && j < output_size - 2; i++) {
-        if (input[i] == '"' || input[i] == '\\') {
-            output[j++] = '\\';
+    for (int i = 0; input[i] && j < output_size - 6; i++) {
+        unsigned char c = (unsigned char)input[i];
+        if (c == '"') {
+            output[j++] = '\\'; output[j++] = '"';
+        } else if (c == '\\') {
+            output[j++] = '\\'; output[j++] = '\\';
+        } else if (c == '\b') {
+            output[j++] = '\\'; output[j++] = 'b';
+        } else if (c == '\f') {
+            output[j++] = '\\'; output[j++] = 'f';
+        } else if (c == '\n') {
+            output[j++] = '\\'; output[j++] = 'n';
+        } else if (c == '\r') {
+            output[j++] = '\\'; output[j++] = 'r';
+        } else if (c == '\t') {
+            output[j++] = '\\'; output[j++] = 't';
+        } else if (c < 0x20) {
+            j += snprintf(output + j, output_size - j, "\\u%04x", c);
+        } else {
+            output[j++] = input[i];
         }
-        output[j++] = input[i];
     }
     output[j] = '\0';
 }
@@ -206,6 +228,8 @@ int main(int argc, char* argv[]) {
     
     // 初始化临界区
     InitializeCriticalSection(&thumbnail_cs);
+    InitializeCriticalSection(&devices_cs);
+    InitializeCriticalSection(&ws_send_cs);
     
     // 初始化 COM（主线程）
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -216,6 +240,8 @@ int main(int argc, char* argv[]) {
         print_log("ERROR", "无法分配 WebSocket 接收缓冲区");
         CoUninitialize();
         DeleteCriticalSection(&thumbnail_cs);
+        DeleteCriticalSection(&devices_cs);
+        DeleteCriticalSection(&ws_send_cs);
         return 1;
     }
     ws_recv_buffer_len = 0;
@@ -303,13 +329,12 @@ int main(int argc, char* argv[]) {
         print_log("SUCCESS", "已连接到中继服务器");
         
         // 扫描 ADB 设备
-        device_count = scan_adb_devices();
-        print_log("INFO", "检测到 %d 个 ADB 设备", device_count);
+        int current_devs = scan_adb_devices();
+        print_log("INFO", "检测到 %d 个 ADB 设备", current_devs);
         
-        if (device_count > 0) {
-            send_device_list();
-            last_thumbnail_update = GetTickCount();
-        }
+        // 始终上报设备列表（即便为0也上报空列表以通知服务端）
+        send_device_list();
+        last_thumbnail_update = GetTickCount();
         
         // 启动缩略图更新线程
         thumbnail_thread = (HANDLE)_beginthreadex(NULL, 0, thumbnail_update_thread, NULL, 0, NULL);
@@ -325,10 +350,12 @@ int main(int argc, char* argv[]) {
         }
         
         // 关闭当前 socket
+        EnterCriticalSection(&ws_send_cs);
         if (ws_socket != INVALID_SOCKET) {
             closesocket(ws_socket);
             ws_socket = INVALID_SOCKET;
         }
+        LeaveCriticalSection(&ws_send_cs);
         
         if (!running) break;
         
@@ -341,6 +368,8 @@ int main(int argc, char* argv[]) {
     free(ws_recv_buffer);
     CoUninitialize();
     DeleteCriticalSection(&thumbnail_cs);
+    DeleteCriticalSection(&devices_cs);
+    DeleteCriticalSection(&ws_send_cs);
     return 0;
 }
 
@@ -520,6 +549,13 @@ bool send_websocket_message(const char* message) {
     frame_len += len;
     
     
+    EnterCriticalSection(&ws_send_cs);
+    if (ws_socket == INVALID_SOCKET) {
+        LeaveCriticalSection(&ws_send_cs);
+        free(frame);
+        return false;
+    }
+
     // 循环发送确保完整发出
     int total_sent = 0;
     bool result = true;
@@ -532,6 +568,7 @@ bool send_websocket_message(const char* message) {
         }
         total_sent += sent;
     }
+    LeaveCriticalSection(&ws_send_cs);
     
     if (result) {
     }
@@ -777,27 +814,32 @@ bool is_valid_serial(const char* serial) {
 
 // 释放所有设备的缩略图内存
 void free_device_thumbnails() {
+    EnterCriticalSection(&devices_cs);
     for (int i = 0; i < MAX_DEVICES; i++) {
         if (devices[i].thumbnail_base64) {
             free(devices[i].thumbnail_base64);
             devices[i].thumbnail_base64 = NULL;
         }
     }
+    LeaveCriticalSection(&devices_cs);
 }
 
 int execute_adb_command(const char* command, char* output, int output_size) {
-    char cmd[512];
+    char cmd[1024];
     const char* adb_exe = resolve_adb_path();
-    sprintf(cmd, "%s %s 2>&1", adb_exe, command);
+    snprintf(cmd, sizeof(cmd), "\"%s\" %s 2>&1", adb_exe, command);
     
     FILE* pipe = _popen(cmd, "r");
     if (!pipe) {
         return -1;
     }
     
-    int total_read = 0;
-    while (fgets(output + total_read, output_size - total_read, pipe) != NULL) {
-        total_read = strlen(output);
+    if (output && output_size > 0) {
+        output[0] = '\0';
+        int total_read = 0;
+        while (total_read < output_size - 1 && fgets(output + total_read, output_size - total_read, pipe) != NULL) {
+            total_read += (int)strlen(output + total_read);
+        }
     }
     
     int exit_code = _pclose(pipe);
@@ -841,13 +883,28 @@ bool rotate_device_via_adb(const char* serial) {
     return false;
 }
 
-int scan_adb_devices() {
+// 检查设备列表是否有变更（数量、序列号或状态）
+bool check_device_list_changed(const Device* new_list, int new_count) {
+    if (new_count != device_count) {
+        return true;
+    }
+    for (int i = 0; i < new_count; i++) {
+        if (strcmp(devices[i].serial, new_list[i].serial) != 0 ||
+            strcmp(devices[i].state, new_list[i].state) != 0 ||
+            strcmp(devices[i].model, new_list[i].model) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 刷新 ADB 设备列表；有变动时返回 true，无变动返回 false
+bool refresh_adb_devices() {
     char adb_output[BUFFER_SIZE];
     
     print_log("INFO", "正在扫描 ADB 设备...");
     
     int exit_code = execute_adb_command("devices -l", adb_output, sizeof(adb_output));
-    
     if (exit_code != 0) {
         static bool first_warning = true;
         if (first_warning) {
@@ -860,14 +917,17 @@ int scan_adb_devices() {
             print_log("INFO", "下载地址: https://developer.android.com/studio/releases/platform-tools");
             first_warning = false;
         }
-        return 0;
+        return false;
     }
     
-    device_count = 0;
+    Device temp_devices[MAX_DEVICES];
+    int temp_count = 0;
+    memset(temp_devices, 0, sizeof(temp_devices));
+
     char* line = strtok(adb_output, "\n");
     bool header_found = false;
     
-    while (line != NULL && device_count < MAX_DEVICES) {
+    while (line != NULL && temp_count < MAX_DEVICES) {
         // 跳过表头
         if (strstr(line, "List of devices attached") != NULL) {
             header_found = true;
@@ -893,19 +953,16 @@ int scan_adb_devices() {
         model[0] = '\0';
         
         // 格式: serial\tstate 或 serial  state (多个空格)
-        // 先尝试 tab 分隔
         char* tab = strchr(line, '\t');
         char* separator = tab;
         
-        // 如果没有 tab，尝试多个空格
         if (!separator) {
             char* space = line;
             while (*space && *space != ' ') space++;
             if (*space == ' ') {
-                // 跳过所有空格
                 while (*space == ' ') space++;
                 if (*space) {
-                    separator = space - 1; // 指向最后一个空格
+                    separator = space - 1;
                 }
             }
         }
@@ -916,37 +973,37 @@ int scan_adb_devices() {
                 strncpy(serial, line, serial_len);
                 serial[serial_len] = '\0';
                 
-                // 移除 serial 末尾的空格
                 while (serial_len > 0 && serial[serial_len - 1] == ' ') {
                     serial[--serial_len] = '\0';
                 }
                 
-                // 获取状态
                 char* state_start = (tab ? tab + 1 : separator + 1);
                 while (*state_start == ' ' || *state_start == '\t') state_start++;
                 
                 if (*state_start) {
                     sscanf(state_start, "%31s", state);
                     
-                    // 查找 model:
                     char* model_marker = strstr(state_start, "model:");
                     if (model_marker) {
                         sscanf(model_marker + 6, "%127s", model);
                     }
                     
-                    // 添加到设备列表
                     if (strlen(serial) > 0 && strlen(state) > 0) {
-                        strcpy(devices[device_count].serial, serial);
-                        strcpy(devices[device_count].state, state);
-                        strcpy(devices[device_count].model, model[0] ? model : "Unknown");
+                        strncpy(temp_devices[temp_count].serial, serial, sizeof(temp_devices[temp_count].serial) - 1);
+                        strncpy(temp_devices[temp_count].state, state, sizeof(temp_devices[temp_count].state) - 1);
+                        strncpy(temp_devices[temp_count].model, model[0] ? model : "Unknown", sizeof(temp_devices[temp_count].model) - 1);
+                        temp_devices[temp_count].custom_name[0] = '\0';
+                        temp_devices[temp_count].thumbnail_base64 = NULL;
+                        temp_devices[temp_count].process_id = 0;
+                        temp_devices[temp_count].streaming = false;
                         
                         print_log("INFO", "  [%d] %s - %s (%s)",
-                            device_count + 1,
-                            devices[device_count].serial,
-                            devices[device_count].state,
-                            devices[device_count].model);
+                            temp_count + 1,
+                            temp_devices[temp_count].serial,
+                            temp_devices[temp_count].state,
+                            temp_devices[temp_count].model);
                         
-                        device_count++;
+                        temp_count++;
                     }
                 }
             }
@@ -955,14 +1012,111 @@ int scan_adb_devices() {
         line = strtok(NULL, "\n");
     }
     
-    return device_count;
+    // 线程安全地检测变动并同步
+    EnterCriticalSection(&devices_cs);
+    bool changed = check_device_list_changed(temp_devices, temp_count);
+    if (!changed) {
+        LeaveCriticalSection(&devices_cs);
+        return false;
+    }
+    
+    // 发生了变动：继承依然在线设备的缩略图和状态，释放已下线设备的缩略图
+    for (int i = 0; i < temp_count; i++) {
+        for (int j = 0; j < device_count; j++) {
+            if (strcmp(temp_devices[i].serial, devices[j].serial) == 0) {
+                temp_devices[i].thumbnail_base64 = devices[j].thumbnail_base64;
+                devices[j].thumbnail_base64 = NULL; // 移交所有权，避免后续被释放
+                temp_devices[i].process_id = devices[j].process_id;
+                temp_devices[i].streaming = devices[j].streaming;
+                strncpy(temp_devices[i].custom_name, devices[j].custom_name, sizeof(temp_devices[i].custom_name) - 1);
+                break;
+            }
+        }
+    }
+    
+    // 释放已断开设备的缩略图堆内存，防止内存泄漏
+    for (int j = 0; j < device_count; j++) {
+        if (devices[j].thumbnail_base64) {
+            free(devices[j].thumbnail_base64);
+            devices[j].thumbnail_base64 = NULL;
+        }
+    }
+    
+    // 拷贝至全局 devices 数组
+    for (int i = 0; i < temp_count; i++) {
+        devices[i] = temp_devices[i];
+    }
+    for (int i = temp_count; i < MAX_DEVICES; i++) {
+        memset(&devices[i], 0, sizeof(Device));
+    }
+    device_count = temp_count;
+    
+    LeaveCriticalSection(&devices_cs);
+    return true;
+}
+
+int scan_adb_devices() {
+    refresh_adb_devices();
+    EnterCriticalSection(&devices_cs);
+    int count = device_count;
+    LeaveCriticalSection(&devices_cs);
+    return count;
+}
+
+// 线程安全、内存安全的单个设备信息上报函数（动态计算大小，防止缓冲区溢出）
+void send_device_update_msg(int device_index) {
+    char serial[256] = {0};
+    char state[32] = {0};
+    char model[128] = {0};
+    char custom_name[256] = {0};
+    char* thumbnail_copy = NULL;
+
+    EnterCriticalSection(&devices_cs);
+    if (device_index < 0 || device_index >= device_count) {
+        LeaveCriticalSection(&devices_cs);
+        return;
+    }
+    strncpy(serial, devices[device_index].serial, sizeof(serial) - 1);
+    strncpy(state, devices[device_index].state, sizeof(state) - 1);
+    strncpy(model, devices[device_index].model, sizeof(model) - 1);
+    strncpy(custom_name, devices[device_index].custom_name, sizeof(custom_name) - 1);
+    if (devices[device_index].thumbnail_base64 && devices[device_index].thumbnail_base64[0]) {
+        thumbnail_copy = strdup(devices[device_index].thumbnail_base64);
+    }
+    LeaveCriticalSection(&devices_cs);
+
+    char escaped_serial[512], escaped_model[256], escaped_name[512];
+    json_escape_string(serial, escaped_serial, sizeof(escaped_serial));
+    json_escape_string(model, escaped_model, sizeof(escaped_model));
+    json_escape_string(custom_name, escaped_name, sizeof(escaped_name));
+
+    size_t needed = (thumbnail_copy ? strlen(thumbnail_copy) : 0) + 2048;
+    char* message = (char*)malloc(needed);
+    if (message) {
+        snprintf(message, needed,
+            "{\"type\":\"deviceUpdate\",\"device\":{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\",\"thumbnail\":\"%s\"}}",
+            escaped_serial,
+            state,
+            escaped_model,
+            escaped_name,
+            thumbnail_copy ? thumbnail_copy : "");
+
+        send_websocket_message(message);
+        free(message);
+    } else {
+        print_log("ERROR", "设备 %s 更新消息内存分配失败: %zu 字节", serial, needed);
+    }
+
+    if (thumbnail_copy) {
+        free(thumbnail_copy);
+    }
 }
 
 void send_device_list() {
     // 加载设备名称
     load_device_names();
     
-    // 为每个设备设置默认名称
+    EnterCriticalSection(&devices_cs);
     const int total_devices = device_count;
     for (int i = 0; i < total_devices; i++) {
         if (devices[i].custom_name[0] == '\0') {
@@ -970,8 +1124,18 @@ void send_device_list() {
         }
     }
 
-    // 先发送完整设备列表快照，确保服务端可清理已下线设备
-    size_t list_capacity = BUFFER_SIZE * 12;
+    // 制作本地快照用于报文生成，减少持锁时间
+    Device local_devices[MAX_DEVICES];
+    for (int i = 0; i < total_devices; i++) {
+        local_devices[i] = devices[i];
+    }
+    LeaveCriticalSection(&devices_cs);
+
+    // 发送完整设备列表快照，确保服务端可清理已下线设备
+    size_t list_capacity = total_devices * 1024 + 1024;
+    if (list_capacity < BUFFER_SIZE * 2) {
+        list_capacity = BUFFER_SIZE * 2;
+    }
     char* list_message = (char*)malloc(list_capacity);
     if (list_message) {
         size_t offset = 0;
@@ -981,15 +1145,15 @@ void send_device_list() {
             offset += (size_t)written;
 
             for (int i = 0; i < total_devices; i++) {
-                char escaped_serial[256], escaped_model[128], escaped_name[256];
-                json_escape_string(devices[i].serial, escaped_serial, sizeof(escaped_serial));
-                json_escape_string(devices[i].model, escaped_model, sizeof(escaped_model));
-                json_escape_string(devices[i].custom_name, escaped_name, sizeof(escaped_name));
+                char escaped_serial[512], escaped_model[256], escaped_name[512];
+                json_escape_string(local_devices[i].serial, escaped_serial, sizeof(escaped_serial));
+                json_escape_string(local_devices[i].model, escaped_model, sizeof(escaped_model));
+                json_escape_string(local_devices[i].custom_name, escaped_name, sizeof(escaped_name));
 
                 written = snprintf(list_message + offset, list_capacity - offset,
                     "{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\"}%s",
                     escaped_serial,
-                    devices[i].state,
+                    local_devices[i].state,
                     escaped_model,
                     escaped_name,
                     (i < total_devices - 1) ? "," : "");
@@ -1020,32 +1184,12 @@ void send_device_list() {
         print_log("WARNING", "设备列表快照内存分配失败");
     }
     
-    // 触发异步缩略图更新，而不是同步获取
+    // 触发异步缩略图更新
     send_device_list_async();
     
-    // 立即发送当前设备信息（可能不包含最新缩略图）
+    // 逐个发送当前设备信息（使用安全动态分配函数）
     for (int i = 0; i < total_devices; i++) {
-        char* message = (char*)malloc(BUFFER_SIZE * 10);  // 分配足够空间
-        if (!message) {
-            print_log("ERROR", "内存分配失败");
-            continue;
-        }
-        
-        char escaped_serial[256], escaped_model[128], escaped_name[256];
-        json_escape_string(devices[i].serial, escaped_serial, sizeof(escaped_serial));
-        json_escape_string(devices[i].model, escaped_model, sizeof(escaped_model));
-        json_escape_string(devices[i].custom_name, escaped_name, sizeof(escaped_name));
-
-        sprintf(message,
-            "{\"type\":\"deviceUpdate\",\"device\":{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\",\"thumbnail\":\"%s\"}}",
-            escaped_serial,
-            devices[i].state,
-            escaped_model,
-            escaped_name,
-            devices[i].thumbnail_base64 ? devices[i].thumbnail_base64 : "");
-
-        send_websocket_message(message);
-        free(message);
+        send_device_update_msg(i);
     }
 }
 
@@ -1594,7 +1738,11 @@ void handle_server_message(const char* message) {
                     snprintf(notify_msg, sizeof(notify_msg),
                         "{\"type\":\"startStreaming\",\"serial\":\"%s\",\"profile\":\"%s\",\"args\":\"%s\",\"keyframeMode\":\"%s\"}",
                         serial, profile.name, profile.args,
+#ifdef USE_WEBRTC
                         local_relay_sync_keyframe_enabled() ? "sync" : "reset");
+#else
+                        "reset");
+#endif
                     send_websocket_message(notify_msg);
                 } else {
                     if (last_exit_code != 0) {
@@ -1804,6 +1952,7 @@ void handle_server_message(const char* message) {
 
 // 停止设备推流
 void stop_device(const char* serial) {
+    if (!serial) return;
 #ifdef USE_WEBRTC
     // 关闭本地客户端连接
     if (g_webrtc_enabled) {
@@ -1816,27 +1965,31 @@ void stop_device(const char* serial) {
     }
 #endif
 
+    DWORD pid_to_kill = 0;
+    EnterCriticalSection(&devices_cs);
     for (int i = 0; i < device_count; i++) {
         if (strcmp(devices[i].serial, serial) == 0 && devices[i].streaming) {
-            if (devices[i].process_id != 0) {
-                // 打开进程句柄
-                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, devices[i].process_id);
-                if (hProcess != NULL) {
-                    // 终止进程
-                    if (TerminateProcess(hProcess, 0)) {
-                        print_log("SUCCESS", "已停止设备 %s 的推流，进程 ID: %lu", serial, devices[i].process_id);
-                    } else {
-                        print_log("ERROR", "无法终止进程 %lu", devices[i].process_id);
-                    }
-                    CloseHandle(hProcess);
-                } else {
-                    print_log("WARNING", "无法打开进程 %lu", devices[i].process_id);
-                }
-
-                devices[i].process_id = 0;
-                devices[i].streaming = false;
-            }
+            pid_to_kill = devices[i].process_id;
+            devices[i].process_id = 0;
+            devices[i].streaming = false;
             break;
+        }
+    }
+    LeaveCriticalSection(&devices_cs);
+
+    if (pid_to_kill != 0) {
+        // 打开进程句柄
+        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid_to_kill);
+        if (hProcess != NULL) {
+            // 终止进程
+            if (TerminateProcess(hProcess, 0)) {
+                print_log("SUCCESS", "已停止设备 %s 的推流，进程 ID: %lu", serial, pid_to_kill);
+            } else {
+                print_log("ERROR", "无法终止进程 %lu", pid_to_kill);
+            }
+            CloseHandle(hProcess);
+        } else {
+            print_log("WARNING", "无法打开进程 %lu", pid_to_kill);
         }
     }
 }
@@ -1844,11 +1997,20 @@ void stop_device(const char* serial) {
 // 停止所有设备推流
 void stop_all_devices() {
     print_log("INFO", "正在停止所有设备...");
-    for (int i = 0; i < device_count; i++) {
-        // 不管streaming状态如何，只要进程ID不为0就尝试停止
-        if (devices[i].process_id != 0) {
-            stop_device(devices[i].serial);
+    char serials[MAX_DEVICES][256];
+    int count = 0;
+
+    EnterCriticalSection(&devices_cs);
+    for (int i = 0; i < device_count && count < MAX_DEVICES; i++) {
+        if (devices[i].process_id != 0 || devices[i].streaming) {
+            strncpy(serials[count++], devices[i].serial, 255);
+            serials[count - 1][255] = '\0';
         }
+    }
+    LeaveCriticalSection(&devices_cs);
+
+    for (int i = 0; i < count; i++) {
+        stop_device(serials[i]);
     }
     
     // 强制终止所有scrcpy进程（额外保障）
@@ -1868,7 +2030,7 @@ void console_loop() {
     ws_recv_buffer_len = 0;
     
     // 记录上次设备扫描时间
-    DWORD last_device_scan = 0;
+    DWORD last_device_scan = GetTickCount();
     const DWORD DEVICE_SCAN_INTERVAL = 30000; // 30秒扫描一次
     
     while (running) {
@@ -1949,13 +2111,17 @@ void console_loop() {
                     running = false;
                     break;
                 } else if (opcode == 0x09) { // Ping frame
-                    // 响应 Pong
+                    // 响应 Pong（加锁防止并发帧撕裂）
                     unsigned char pong[2] = {0x8A, 0x80}; // FIN + Pong + MASK + 0 length
                     unsigned char pong_mask[4] = {0, 0, 0, 0};
                     char pong_frame[6];
                     memcpy(pong_frame, pong, 2);
                     memcpy(pong_frame + 2, pong_mask, 4);
-                    send(ws_socket, pong_frame, 6, 0);
+                    EnterCriticalSection(&ws_send_cs);
+                    if (ws_socket != INVALID_SOCKET) {
+                        send(ws_socket, pong_frame, 6, 0);
+                    }
+                    LeaveCriticalSection(&ws_send_cs);
                 }
                 
                 // 从缓冲区中移除已处理的帧
@@ -1965,18 +2131,17 @@ void console_loop() {
                 }
                 ws_recv_buffer_len = remaining;
             }
-        } else if (result == 0) {
-            // 超时，定期扫描设备（但不阻塞）
-            DWORD current_time = GetTickCount();
-            if (current_time - last_device_scan > DEVICE_SCAN_INTERVAL) {
-                if (InterlockedCompareExchange(&g_start_device_in_progress, 0, 0) != 1) {
-                    int new_count = scan_adb_devices();
-                    if (new_count != device_count) {
-                        print_log("INFO", "设备列表已更新");
-                        send_device_list();  // 这会触发异步缩略图更新
-                    }
-                    last_device_scan = current_time;
+        }
+        
+        // 定期扫描设备（每 30 秒检查一次，不论 select 是否有新消息到达）
+        DWORD current_time = GetTickCount();
+        if (current_time - last_device_scan > DEVICE_SCAN_INTERVAL) {
+            if (InterlockedCompareExchange(&g_start_device_in_progress, 0, 0) != 1) {
+                if (refresh_adb_devices()) {
+                    print_log("INFO", "检测到设备列表发生变动，重新上报设备列表...");
+                    send_device_list();  // 这会发送完整快照并触发异步缩略图更新
                 }
+                last_device_scan = current_time;
             }
         }
     }
@@ -1994,9 +2159,12 @@ void cleanup() {
     }
 #endif
 
+    EnterCriticalSection(&ws_send_cs);
     if (ws_socket != INVALID_SOCKET) {
         closesocket(ws_socket);
+        ws_socket = INVALID_SOCKET;
     }
+    LeaveCriticalSection(&ws_send_cs);
     WSACleanup();
 
     print_log("INFO", "程序已退出");
@@ -2047,17 +2215,28 @@ unsigned __stdcall capture_screenshot_thread(void* param) {
 
 // 捕获设备截图并生成缩略图（使用 WIC）
 void capture_device_screenshot(int device_index) {
+    char serial[256] = {0};
+    EnterCriticalSection(&devices_cs);
     if (device_index < 0 || device_index >= device_count) {
+        LeaveCriticalSection(&devices_cs);
         return;
     }
     
-    Device* device = &devices[device_index];
+    // 过滤非可用状态设备（未就绪或离线设备跳过截图）
+    if (strcmp(devices[device_index].state, "device") != 0) {
+        LeaveCriticalSection(&devices_cs);
+        return;
+    }
+    
+    strncpy(serial, devices[device_index].serial, sizeof(serial) - 1);
+    LeaveCriticalSection(&devices_cs);
+    
     char screenshot_path[512];
     char thumbnail_path[512];
     WCHAR screenshot_path_w[512];
     
-    sprintf(screenshot_path, "screenshot_%s.png", device->serial);
-    sprintf(thumbnail_path, "thumbnail_%s.jpg", device->serial);
+    snprintf(screenshot_path, sizeof(screenshot_path), "screenshot_%s.png", serial);
+    snprintf(thumbnail_path, sizeof(thumbnail_path), "thumbnail_%s.jpg", serial);
     MultiByteToWideChar(CP_UTF8, 0, screenshot_path, -1, screenshot_path_w, 512);
     
     // 使用 ADB 直接保存截图到文件
@@ -2066,37 +2245,34 @@ void capture_device_screenshot(int device_index) {
     
     // 截图并保存到设备
     char device_temp_path[256];
-    sprintf(device_temp_path, "/sdcard/screenshot_%s.png", device->serial);
+    snprintf(device_temp_path, sizeof(device_temp_path), "/sdcard/screenshot_%s.png", serial);
     
     // 验证 serial 安全性
-    if (!is_valid_serial(device->serial)) {
-        print_log("ERROR", "设备 %s serial 无效，跳过截图", device->serial);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
+    if (!is_valid_serial(serial)) {
+        print_log("ERROR", "设备 %s serial 无效，跳过截图", serial);
         return;
     }
     
-    sprintf(adb_cmd, "%s -s %s shell screencap -p %s", adb_exe, device->serial, device_temp_path);
+    snprintf(adb_cmd, sizeof(adb_cmd), "\"%s\" -s %s shell screencap -p %s", adb_exe, serial, device_temp_path);
     
     // 使用 system() 执行命令（阻塞等待完成）
     int screencap_result = system(adb_cmd);
     if (screencap_result != 0) {
-        print_log("WARNING", "设备 %s 截图命令失败: %d", device->serial, screencap_result);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
+        print_log("WARNING", "设备 %s 截图命令失败: %d", serial, screencap_result);
         return;
     }
     
     // 检查截图是否成功创建
     Sleep(300);
     
-    sprintf(adb_cmd, "%s -s %s pull %s %s >nul 2>&1", adb_exe, device->serial, device_temp_path, screenshot_path);
+    snprintf(adb_cmd, sizeof(adb_cmd), "\"%s\" -s %s pull %s %s >nul 2>&1", adb_exe, serial, device_temp_path, screenshot_path);
     int result = system(adb_cmd);
     
     char cleanup_cmd[1024];
-    sprintf(cleanup_cmd, "%s -s %s shell rm %s >nul 2>&1", adb_exe, device->serial, device_temp_path);
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "\"%s\" -s %s shell rm %s >nul 2>&1", adb_exe, serial, device_temp_path);
     system(cleanup_cmd);
     
     if (result != 0) {
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         return;
     }
     
@@ -2104,14 +2280,13 @@ void capture_device_screenshot(int device_index) {
     WIN32_FILE_ATTRIBUTE_DATA fileAttr;
     if (!GetFileAttributesExA(screenshot_path, GetFileExInfoStandard, &fileAttr) || 
         fileAttr.nFileSizeLow == 0) {
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
     
     // 使用 WIC 加载和压缩图片
     IWICImagingFactory* pFactory = NULL;
-    HRESULT hr; // 声明hr变量
+    HRESULT hr;
     hr = CoCreateInstance(
         &CLSID_WICImagingFactory,
         NULL,
@@ -2121,8 +2296,7 @@ void capture_device_screenshot(int device_index) {
     );
     
     if (FAILED(hr) || !pFactory) {
-        print_log("WARNING", "设备 %s WIC 初始化失败: 0x%08X", device->serial, hr);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
+        print_log("WARNING", "设备 %s WIC 初始化失败: 0x%08X", serial, hr);
         DeleteFileA(screenshot_path);
         return;
     }
@@ -2139,9 +2313,8 @@ void capture_device_screenshot(int device_index) {
     );
     
     if (FAILED(hr)) {
-        print_log("WARNING", "设备 %s WIC 加载失败: 0x%08X", device->serial, hr);
+        print_log("WARNING", "设备 %s WIC 加载失败: 0x%08X", serial, hr);
         pFactory->lpVtbl->Release(pFactory);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
@@ -2153,7 +2326,6 @@ void capture_device_screenshot(int device_index) {
     if (FAILED(hr)) {
         pDecoder->lpVtbl->Release(pDecoder);
         pFactory->lpVtbl->Release(pFactory);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
@@ -2188,7 +2360,6 @@ void capture_device_screenshot(int device_index) {
         pFrame->lpVtbl->Release(pFrame);
         pDecoder->lpVtbl->Release(pDecoder);
         pFactory->lpVtbl->Release(pFactory);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
@@ -2200,7 +2371,7 @@ void capture_device_screenshot(int device_index) {
     // 创建空的内存流（自动增长）
     IStream* pMemStream = NULL;
     if (SUCCEEDED(hr)) {
-        hr = CreateStreamOnHGlobal(NULL, TRUE, &pMemStream);  // NULL 表示自动分配内存
+        hr = CreateStreamOnHGlobal(NULL, TRUE, &pMemStream);
     }
     
     if (SUCCEEDED(hr)) {
@@ -2269,21 +2440,17 @@ void capture_device_screenshot(int device_index) {
     // 从内存流读取数据并写入文件
     BOOL write_success = FALSE;
     if (SUCCEEDED(hr) && pMemStream) {
-        // 获取实际数据大小
         STATSTG stat;
         if (SUCCEEDED(pMemStream->lpVtbl->Stat(pMemStream, &stat, STATFLAG_NONAME))) {
             ULONG dataSize = (ULONG)stat.cbSize.QuadPart;
             
-            // 重置流位置到开头
             LARGE_INTEGER zero = {{0}};
             pMemStream->lpVtbl->Seek(pMemStream, zero, STREAM_SEEK_SET, NULL);
             
-            // 分配缓冲区并读取
             unsigned char* buffer = (unsigned char*)malloc(dataSize);
             if (buffer) {
                 ULONG bytesRead = 0;
                 if (SUCCEEDED(pMemStream->lpVtbl->Read(pMemStream, buffer, dataSize, &bytesRead)) && bytesRead > 0) {
-                    // 写入文件
                     FILE* fp = fopen(thumbnail_path, "wb");
                     if (fp) {
                         fwrite(buffer, 1, bytesRead, fp);
@@ -2310,7 +2477,6 @@ void capture_device_screenshot(int device_index) {
     if (pFactory) pFactory->lpVtbl->Release(pFactory);
     
     if (FAILED(hr) || !write_success) {
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
@@ -2318,7 +2484,6 @@ void capture_device_screenshot(int device_index) {
     // 读取缩略图文件
     FILE* fp = fopen(thumbnail_path, "rb");
     if (fp == NULL) {
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         return;
     }
@@ -2331,7 +2496,6 @@ void capture_device_screenshot(int device_index) {
     // 限制最大 100KB
     if (thumb_size > 100 * 1024) {
         fclose(fp);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         DeleteFileA(thumbnail_path);
         return;
@@ -2345,17 +2509,34 @@ void capture_device_screenshot(int device_index) {
         
         // Base64 编码（输出大小约为输入的 4/3 倍 + 对齐）
         size_t b64_size = ((thumb_size + 2) / 3) * 4 + 1;
-        if (device->thumbnail_base64) free(device->thumbnail_base64);
-        device->thumbnail_base64 = (char*)malloc(b64_size);
-        if (device->thumbnail_base64) {
-            base64_encode(buffer, thumb_size, device->thumbnail_base64);
+        char* new_b64 = (char*)malloc(b64_size);
+        if (new_b64) {
+            base64_encode(buffer, thumb_size, new_b64);
+            
+            // 安全更新回 devices 数组
+            EnterCriticalSection(&devices_cs);
+            for (int i = 0; i < device_count; i++) {
+                if (strcmp(devices[i].serial, serial) == 0) {
+                    if (devices[i].thumbnail_base64) {
+                        free(devices[i].thumbnail_base64);
+                    }
+                    devices[i].thumbnail_base64 = new_b64;
+                    new_b64 = NULL; // 移交所有权
+                    break;
+                }
+            }
+            LeaveCriticalSection(&devices_cs);
+            
+            if (new_b64) {
+                // 设备在截图过程中已断开，释放分配的 Base64 内存
+                free(new_b64);
+            }
         } else {
-            print_log("ERROR", "设备 %s Base64内存分配失败", device->serial);
+            print_log("ERROR", "设备 %s Base64内存分配失败", serial);
         }
         free(buffer);
     } else {
         fclose(fp);
-        if (device->thumbnail_base64) { free(device->thumbnail_base64); device->thumbnail_base64 = NULL; }
         DeleteFileA(screenshot_path);
         DeleteFileA(thumbnail_path);
         return;
@@ -2367,32 +2548,14 @@ void capture_device_screenshot(int device_index) {
 }
 
 void send_updated_device_list() {
-    // 逐个发送设备更新信息到服务器
-    for (int i = 0; i < device_count; i++) {
-        char* message = (char*)malloc(BUFFER_SIZE * 10);  // 分配足够空间
-        if (!message) {
-            print_log("ERROR", "内存分配失败");
-            continue;
-        }
-        
-        char escaped_serial[256], escaped_model[128], escaped_name[256];
-        json_escape_string(devices[i].serial, escaped_serial, sizeof(escaped_serial));
-        json_escape_string(devices[i].model, escaped_model, sizeof(escaped_model));
-        json_escape_string(devices[i].custom_name, escaped_name, sizeof(escaped_name));
+    int count = 0;
+    EnterCriticalSection(&devices_cs);
+    count = device_count;
+    LeaveCriticalSection(&devices_cs);
 
-        sprintf(message,
-            "{\"type\":\"deviceUpdate\",\"device\":{\"serial\":\"%s\",\"state\":\"%s\",\"model\":\"%s\",\"customName\":\"%s\",\"thumbnail\":\"%s\"}}",
-            escaped_serial,
-            devices[i].state,
-            escaped_model,
-            escaped_name,
-            devices[i].thumbnail_base64 ? devices[i].thumbnail_base64 : "");
-        
-        //print_log("DEBUG", "发送设备更新信息: %s", message);
-        
-        send_websocket_message(message);
-        free(message);
-        
+    // 逐个安全发送设备更新信息到服务器（动态分配，杜绝堆溢出）
+    for (int i = 0; i < count; i++) {
+        send_device_update_msg(i);
     }
 }
 
@@ -2412,17 +2575,21 @@ void load_device_names() {
             char* serial = line;
             char* name = sep + 1;
             
-            // 移除换行符
+            // 移除换行符及回车符
             char* newline = strchr(name, '\n');
             if (newline) *newline = '\0';
+            char* cr = strchr(name, '\r');
+            if (cr) *cr = '\0';
             
             // 查找对应设备
+            EnterCriticalSection(&devices_cs);
             for (int i = 0; i < device_count; i++) {
                 if (strcmp(devices[i].serial, serial) == 0) {
                     strncpy(devices[i].custom_name, name, sizeof(devices[i].custom_name) - 1);
                     break;
                 }
             }
+            LeaveCriticalSection(&devices_cs);
         }
     }
     
@@ -2431,13 +2598,17 @@ void load_device_names() {
 
 // 保存设备名称
 void save_device_name(const char* serial, const char* custom_name) {
+    if (!serial || !custom_name) return;
+
     // 更新内存中的设备名称
+    EnterCriticalSection(&devices_cs);
     for (int i = 0; i < device_count; i++) {
         if (strcmp(devices[i].serial, serial) == 0) {
             strncpy(devices[i].custom_name, custom_name, sizeof(devices[i].custom_name) - 1);
             break;
         }
     }
+    LeaveCriticalSection(&devices_cs);
     
     // 读取所有现有设备名称
     char all_names[MAX_DEVICES][512];
@@ -2452,7 +2623,7 @@ void save_device_name(const char* serial, const char* custom_name) {
                 *sep = '\0';
                 if (strcmp(line, serial) != 0) {  // 跳过当前设备
                     *sep = '|';
-                    strcpy(all_names[name_count++], line);
+                    strncpy(all_names[name_count++], line, sizeof(all_names[0]) - 1);
                 }
             }
         }
