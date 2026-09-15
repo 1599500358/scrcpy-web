@@ -434,11 +434,20 @@ static bool do_websocket_handshake(SOCKET sock, char* serial_out, int serial_siz
     return true;
 }
 
+static bool recv_exact(SOCKET sock, void* buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int r = recv(sock, (char*)buf + total, len - total, 0);
+        if (r <= 0) return false;
+        total += r;
+    }
+    return true;
+}
+
 // 处理视频数据的 WebSocket 帧解析
 static int recv_ws_frame(SOCKET sock, uint8_t* buffer, int buffer_size) {
     uint8_t header[2];
-    int received = recv(sock, (char*)header, 2, 0);
-    if (received <= 0) {
+    if (!recv_exact(sock, header, 2)) {
         return -1; // 连接关闭或错误
     }
 
@@ -449,34 +458,34 @@ static int recv_ws_frame(SOCKET sock, uint8_t* buffer, int buffer_size) {
 
     if (payload_len == 126) {
         uint8_t ext_len[2];
-        if (recv(sock, (char*)ext_len, 2, 0) <= 0) return -1;
+        if (!recv_exact(sock, ext_len, 2)) return -1;
         payload_len = (ext_len[0] << 8) | ext_len[1];
     } else if (payload_len == 127) {
         uint8_t ext_len[8];
-        if (recv(sock, (char*)ext_len, 8, 0) <= 0) return -1;
-        payload_len = 0;
-        for (int i = 0; i < 8; i++) {
-            payload_len = (payload_len << 8) | ext_len[i];
+        if (!recv_exact(sock, ext_len, 8)) return -1;
+        uint32_t high = ((uint32_t)ext_len[0] << 24) | ((uint32_t)ext_len[1] << 16) | ((uint32_t)ext_len[2] << 8) | (uint32_t)ext_len[3];
+        uint32_t low = ((uint32_t)ext_len[4] << 24) | ((uint32_t)ext_len[5] << 16) | ((uint32_t)ext_len[6] << 8) | (uint32_t)ext_len[7];
+        if (high != 0 || low > (uint32_t)buffer_size) {
+            print_log("WARN", "[LocalRelay] 64位帧长度超限: high=%u, low=%u, max=%d", high, low, buffer_size);
+            return -1;
         }
+        payload_len = (int)low;
+    }
+
+    if (payload_len < 0 || payload_len > buffer_size) {
+        // 缓冲区不足或长度非法
+        print_log("WARN", "[LocalRelay] 帧大小非法: %d > %d", payload_len, buffer_size);
+        return -1;
     }
 
     uint8_t mask_key[4] = {0};
     if (masked) {
-        if (recv(sock, (char*)mask_key, 4, 0) <= 0) return -1;
-    }
-
-    if (payload_len > buffer_size) {
-        // 缓冲区不足，需要分段读取
-        print_log("WARN", "[LocalRelay] 帧太大: %d > %d", payload_len, buffer_size);
-        return -1;
+        if (!recv_exact(sock, mask_key, 4)) return -1;
     }
 
     // 读取负载数据
-    int total_received = 0;
-    while (total_received < payload_len) {
-        int r = recv(sock, (char*)buffer + total_received, payload_len - total_received, 0);
-        if (r <= 0) return -1;
-        total_received += r;
+    if (!recv_exact(sock, buffer, payload_len)) {
+        return -1;
     }
 
     // 解除 mask

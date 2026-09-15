@@ -39,23 +39,43 @@ async function initTurnServer(options = {}) {
         // 动态加载 node-turn
         const turn = require('node-turn');
 
-        // 生成凭证密钥
-        const credentials = {};
+        // 生成初始凭据并支持动态时间戳凭证验证
+        const baseCredentials = {};
         const username = generateTimestampUsername();
         const credential = generateCredential(username, secret);
 
-        credentials[username] = credential;
+        baseCredentials[username] = credential;
+
+        const credentialsProxy = new Proxy(baseCredentials, {
+            get(target, prop) {
+                if (typeof prop !== 'string') return target[prop];
+                if (target[prop]) return target[prop];
+                const parts = prop.split(':');
+                const ts = parseInt(parts[0], 10);
+                if (!isNaN(ts)) {
+                    const now = Math.floor(Date.now() / 1000);
+                    if (ts >= now) {
+                        return generateCredential(prop, secret);
+                    }
+                }
+                return undefined;
+            },
+            has(target, prop) {
+                if (typeof prop !== 'string') return prop in target;
+                if (prop in target) return true;
+                const parts = prop.split(':');
+                const ts = parseInt(parts[0], 10);
+                if (!isNaN(ts)) {
+                    const now = Math.floor(Date.now() / 1000);
+                    return ts >= now;
+                }
+                return false;
+            }
+        });
 
         turnServer = new turn({
-            authFunc: (username, cb) => {
-                if (credentials[username]) {
-                    cb(credentials[username], 'user');
-                } else {
-                    // 支持时间戳凭证
-                    const expectedCred = generateCredential(username, secret);
-                    cb(expectedCred, 'user');
-                }
-            },
+            authMech: 'long-term',
+            credentials: credentialsProxy,
             realm: realm,
             minPort: minPort,
             maxPort: maxPort,
@@ -92,6 +112,8 @@ function stopTurnServer() {
     if (turnServer) {
         turnServer.stop();
         turnServer = null;
+        // 同步清空配置，避免停止后 getTurnConfig 仍向 Web 端发放失效凭证
+        turnConfig = null;
         console.log('[TURN] TURN 服务器已停止');
     }
 }

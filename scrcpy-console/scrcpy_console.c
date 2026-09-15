@@ -497,15 +497,32 @@ bool connect_to_server() {
     
     send(ws_socket, handshake, strlen(handshake), 0);
     
-    // 接收握手响应
+    // 接收握手响应（持续读取直到找到 HTTP 头结束符 \r\n\r\n，并保留后续伴随的 WebSocket 数据）
     char response[2048];
-    recv(ws_socket, response, sizeof(response), 0);
-    
-    if (strstr(response, "101 Switching Protocols") == NULL) {
-        return false;
+    int total_recvd = 0;
+    while (total_recvd < (int)sizeof(response) - 1) {
+        int n = recv(ws_socket, response + total_recvd, sizeof(response) - 1 - total_recvd, 0);
+        if (n <= 0) {
+            return false;
+        }
+        total_recvd += n;
+        response[total_recvd] = '\0';
+        char* header_end = strstr(response, "\r\n\r\n");
+        if (header_end) {
+            if (strstr(response, "101 Switching Protocols") == NULL) {
+                return false;
+            }
+            int header_len = (int)((header_end + 4) - response);
+            int remaining = total_recvd - header_len;
+            if (remaining > 0 && ws_recv_buffer) {
+                memcpy(ws_recv_buffer, header_end + 4, remaining);
+                ws_recv_buffer_len = remaining;
+            }
+            return true;
+        }
     }
     
-    return true;
+    return false;
 }
 
 bool send_websocket_message(const char* message) {
@@ -1818,6 +1835,8 @@ void handle_server_message(const char* message) {
             if (serial_end) {
                 char serial[256];
                 int len = serial_end - serial_start;
+                if (len >= (int)sizeof(serial)) len = (int)sizeof(serial) - 1;
+                if (len < 0) len = 0;
                 strncpy(serial, serial_start, len);
                 serial[len] = '\0';
                 
@@ -1834,6 +1853,8 @@ void handle_server_message(const char* message) {
             if (serial_end) {
                 char serial[256];
                 int len = serial_end - serial_start;
+                if (len >= (int)sizeof(serial)) len = (int)sizeof(serial) - 1;
+                if (len < 0) len = 0;
                 strncpy(serial, serial_start, len);
                 serial[len] = '\0';
                 
@@ -1867,6 +1888,10 @@ void handle_server_message(const char* message) {
                 char serial[256], custom_name[256];
                 int serial_len = serial_end - serial_start;
                 int name_len = name_end - name_start;
+                if (serial_len >= (int)sizeof(serial)) serial_len = (int)sizeof(serial) - 1;
+                if (serial_len < 0) serial_len = 0;
+                if (name_len >= (int)sizeof(custom_name)) name_len = (int)sizeof(custom_name) - 1;
+                if (name_len < 0) name_len = 0;
                 
                 strncpy(serial, serial_start, serial_len);
                 serial[serial_len] = '\0';
@@ -2064,6 +2089,91 @@ void stop_all_devices() {
     system("taskkill /F /IM scrcpy.exe /T >nul 2>nul");
 }
 
+static void process_ws_recv_buffer(void) {
+    while (running && ws_recv_buffer_len >= 2) {
+        unsigned char* buf = (unsigned char*)ws_recv_buffer;
+        int opcode = buf[0] & 0x0F;
+        bool is_masked = (buf[1] & 0x80) != 0;
+        int payload_len = buf[1] & 0x7F;
+        int header_size = 2;
+        
+        if (payload_len == 126) {
+            if (ws_recv_buffer_len < 4) break; // 需要更多数据
+            payload_len = (buf[2] << 8) | buf[3];
+            header_size = 4;
+        } else if (payload_len == 127) {
+            if (ws_recv_buffer_len < 10) break;
+            // 64-bit 长度安全检查
+            uint32_t high = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16) | ((uint32_t)buf[4] << 8) | (uint32_t)buf[5];
+            uint32_t low = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16) | ((uint32_t)buf[8] << 8) | (uint32_t)buf[9];
+            if (high != 0 || low > (uint32_t)MAX_WS_PAYLOAD_SIZE) {
+                print_log("ERROR", "WebSocket 帧超长或非法: high=%u, low=%u", high, low);
+                running = false;
+                break;
+            }
+            payload_len = (int)low;
+            header_size = 10;
+        }
+        
+        if (payload_len < 0 || payload_len > MAX_WS_PAYLOAD_SIZE) {
+            print_log("ERROR", "WebSocket 帧长度非法: %d", payload_len);
+            running = false;
+            break;
+        }
+        
+        if (is_masked) header_size += 4; // 掩码键
+        
+        int total_frame_len = header_size + payload_len;
+        if (ws_recv_buffer_len < total_frame_len) break; // 帧不完整，等待更多数据
+        
+        // 完整帧已就绪
+        if (opcode == 0x01) { // Text frame
+            // 解除掩码（如果有）
+            char* payload = ws_recv_buffer + header_size;
+            if (is_masked) {
+                unsigned char* mask_key = buf + header_size - 4;
+                for (int i = 0; i < payload_len; i++) {
+                    payload[i] ^= mask_key[i % 4];
+                }
+            }
+            
+            // 分配消息缓冲区并处理
+            char* message = (char*)malloc(payload_len + 1);
+            if (message) {
+                memcpy(message, payload, payload_len);
+                message[payload_len] = '\0';
+                
+                print_log("INFO", "收到服务器消息: %s", message);
+                handle_server_message(message);
+                free(message);
+            }
+        } else if (opcode == 0x08) { // Close frame
+            print_log("INFO", "收到服务器关闭帧");
+            running = false;
+            break;
+        } else if (opcode == 0x09) { // Ping frame
+            // 响应 Pong（加锁防止并发帧撕裂）
+            unsigned char pong[2] = {0x8A, 0x80}; // FIN + Pong + MASK + 0 length
+            unsigned char pong_mask[4] = {0, 0, 0, 0};
+            char pong_frame[6];
+            memcpy(pong_frame, pong, 2);
+            memcpy(pong_frame + 2, pong_mask, 4);
+            EnterCriticalSection(&ws_send_cs);
+            if (ws_socket != INVALID_SOCKET) {
+                send(ws_socket, pong_frame, 6, 0);
+            }
+            LeaveCriticalSection(&ws_send_cs);
+        }
+        
+        // 从缓冲区中移除已处理的帧
+        int remaining = ws_recv_buffer_len - total_frame_len;
+        if (remaining > 0) {
+            memmove(ws_recv_buffer, ws_recv_buffer + total_frame_len, remaining);
+        }
+        ws_recv_buffer_len = remaining;
+    }
+}
+
 void console_loop() {
     print_log("INFO", "进入主循环，等待服务器消息...");
     print_log("INFO", "按 Ctrl+C 退出");
@@ -2072,8 +2182,8 @@ void console_loop() {
     fd_set read_fds;
     struct timeval tv;
     
-    // WebSocket 帧组装状态
-    ws_recv_buffer_len = 0;
+    // 若握手时已随 HTTP 响应附带了首个 WebSocket 帧（例如 welcome 消息），先进行解析
+    process_ws_recv_buffer();
     
     // 记录上次设备扫描时间
     DWORD last_device_scan = GetTickCount();
@@ -2107,76 +2217,7 @@ void console_loop() {
             memcpy(ws_recv_buffer + ws_recv_buffer_len, recv_buf, received);
             ws_recv_buffer_len += received;
             
-            // 尝试解析完整的 WebSocket 帧
-            while (ws_recv_buffer_len >= 2) {
-                unsigned char* buf = (unsigned char*)ws_recv_buffer;
-                int opcode = buf[0] & 0x0F;
-                bool is_masked = (buf[1] & 0x80) != 0;
-                int payload_len = buf[1] & 0x7F;
-                int header_size = 2;
-                
-                if (payload_len == 126) {
-                    if (ws_recv_buffer_len < 4) break; // 需要更多数据
-                    payload_len = (buf[2] << 8) | buf[3];
-                    header_size = 4;
-                } else if (payload_len == 127) {
-                    if (ws_recv_buffer_len < 10) break;
-                    // 64-bit 长度（只取低 32 位，足够）
-                    payload_len = (buf[6] << 24) | (buf[7] << 16) | (buf[8] << 8) | buf[9];
-                    header_size = 10;
-                }
-                
-                if (is_masked) header_size += 4; // 掩码键
-                
-                int total_frame_len = header_size + payload_len;
-                if (ws_recv_buffer_len < total_frame_len) break; // 帧不完整，等待更多数据
-                
-                // 完整帧已就绪
-                if (opcode == 0x01) { // Text frame
-                    // 解除掩码（如果有）
-                    char* payload = ws_recv_buffer + header_size;
-                    if (is_masked) {
-                        unsigned char* mask_key = buf + header_size - 4;
-                        for (int i = 0; i < payload_len; i++) {
-                            payload[i] ^= mask_key[i % 4];
-                        }
-                    }
-                    
-                    // 分配消息缓冲区并处理
-                    char* message = (char*)malloc(payload_len + 1);
-                    if (message) {
-                        memcpy(message, payload, payload_len);
-                        message[payload_len] = '\0';
-                        
-                        print_log("INFO", "收到服务器消息: %s", message);
-                        handle_server_message(message);
-                        free(message);
-                    }
-                } else if (opcode == 0x08) { // Close frame
-                    print_log("INFO", "收到服务器关闭帧");
-                    running = false;
-                    break;
-                } else if (opcode == 0x09) { // Ping frame
-                    // 响应 Pong（加锁防止并发帧撕裂）
-                    unsigned char pong[2] = {0x8A, 0x80}; // FIN + Pong + MASK + 0 length
-                    unsigned char pong_mask[4] = {0, 0, 0, 0};
-                    char pong_frame[6];
-                    memcpy(pong_frame, pong, 2);
-                    memcpy(pong_frame + 2, pong_mask, 4);
-                    EnterCriticalSection(&ws_send_cs);
-                    if (ws_socket != INVALID_SOCKET) {
-                        send(ws_socket, pong_frame, 6, 0);
-                    }
-                    LeaveCriticalSection(&ws_send_cs);
-                }
-                
-                // 从缓冲区中移除已处理的帧
-                int remaining = ws_recv_buffer_len - total_frame_len;
-                if (remaining > 0) {
-                    memmove(ws_recv_buffer, ws_recv_buffer + total_frame_len, remaining);
-                }
-                ws_recv_buffer_len = remaining;
-            }
+            process_ws_recv_buffer();
         }
         
         // 定期扫描设备（每 30 秒检查一次，不论 select 是否有新消息到达）

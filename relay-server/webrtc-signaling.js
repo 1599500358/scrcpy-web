@@ -49,33 +49,44 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
         return;
     }
 
+    // 校验设备所有权：Offer 必须由所属控制台发起
+    if (!deviceId.startsWith(`${consoleId}:`)) {
+        console.log(`[WebRTC] 拦截非法 Offer：控制台 ${consoleId} 不拥有设备 ${deviceId}`);
+        return;
+    }
+
     console.log(`[WebRTC] ========== 收到 Offer ==========`);
     console.log(`[WebRTC] 控制台: ${consoleId}`);
     console.log(`[WebRTC] 设备: ${deviceId}`);
     console.log(`[WebRTC] SDP 类型: ${sdp.type}`);
 
-    // 存储连接信息
+    // 查找所有正在观看该设备的 Web 客户端
+    const targetWebClients = [];
+    const allowedViewers = new Set();
+    console.log(`[WebRTC] 查找 Web 客户端，当前 webClients 数量: ${webClients ? webClients.size : 0}`);
+
+    if (webClients) {
+        webClients.forEach((client, clientId) => {
+            if (client.currentDevice === deviceId && client.ws && client.ws.readyState === 1) {
+                targetWebClients.push({ ws: client.ws, clientId });
+                allowedViewers.add(clientId);
+            }
+        });
+    }
+
+    // 存储连接信息与授权观看者列表
     pendingConnections.set(deviceId, {
         consoleId,
         consoleWs,
         offer: sdp,
         candidates: [],
-        webWs: null,
+        webWs: targetWebClients.length > 0 ? targetWebClients[0].ws : null,
+        targetWebClients,
+        allowedViewers,
         answer: null
     });
 
-    // 查找正在观看该设备的 Web 客户端
-    let targetWebClient = null;
-    console.log(`[WebRTC] 查找 Web 客户端，当前 webClients 数量: ${webClients.size}`);
-
-    webClients.forEach((client, clientId) => {
-        console.log(`[WebRTC]   检查 ${clientId}: currentDevice="${client.currentDevice}", 目标="${deviceId}", 匹配: ${client.currentDevice === deviceId}`);
-        if (client.currentDevice === deviceId) {
-            targetWebClient = { ws: client.ws, clientId };
-        }
-    });
-
-    if (targetWebClient && targetWebClient.ws.readyState === 1) { // WebSocket.OPEN
+    if (targetWebClients.length > 0) {
         const offerMsg = JSON.stringify({
             type: 'webrtc-offer',
             deviceId,
@@ -83,27 +94,23 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
             consoleId
         });
 
-        targetWebClient.ws.send(offerMsg);
-
-        // 更新连接信息
-        const conn = pendingConnections.get(deviceId);
-        if (conn) {
-            conn.webWs = targetWebClient.ws;
-        }
-
-        console.log(`[WebRTC] ✅ Offer 已转发给 Web 客户端 ${targetWebClient.clientId}`);
+        targetWebClients.forEach(({ ws: clientWs, clientId }) => {
+            clientWs.send(offerMsg);
+            console.log(`[WebRTC] ✅ Offer 已转发给 Web 客户端 ${clientId}`);
+        });
         console.log(`[WebRTC] ================================`);
     } else {
         console.log(`[WebRTC] ❌ 未找到观看设备 ${deviceId} 的 Web 客户端`);
-        console.log(`[WebRTC]   原因: ${!targetWebClient ? '没有匹配的客户端' : '连接状态异常 (' + targetWebClient.ws.readyState + ')'}`);
         console.log(`[WebRTC] ================================`);
 
         // 通知控制台等待 Web 客户端
-        consoleWs.send(JSON.stringify({
-            type: 'webrtc-waiting',
-            deviceId,
-            message: '等待 Web 客户端连接'
-        }));
+        if (consoleWs && consoleWs.readyState === 1) {
+            consoleWs.send(JSON.stringify({
+                type: 'webrtc-waiting',
+                deviceId,
+                message: '等待 Web 客户端连接'
+            }));
+        }
     }
 }
 
@@ -112,8 +119,9 @@ function handleOffer(consoleId, msg, consoleWs, webClients) {
  * @param {string} webClientId - Web 客户端 ID
  * @param {Object} msg - 消息对象 { type, deviceId, sdp }
  * @param {Map} consoleClients - 控制台客户端映射
+ * @param {Map} [webClients] - 可选的 Web 客户端映射
  */
-function handleAnswer(webClientId, msg, consoleClients) {
+function handleAnswer(webClientId, msg, consoleClients, webClients) {
     const { deviceId, sdp } = msg;
 
     if (!deviceId || !sdp) {
@@ -123,9 +131,21 @@ function handleAnswer(webClientId, msg, consoleClients) {
 
     console.log(`[WebRTC] 收到 Web 客户端 ${webClientId} 的 answer，设备: ${deviceId}`);
 
+    // 校验参与者：Web 客户端必须在允许的观看者集合中，或其 currentDevice 确为该 deviceId
     const conn = pendingConnections.get(deviceId);
     if (!conn) {
         console.log(`[WebRTC] 未找到设备 ${deviceId} 的待处理连接`);
+        return;
+    }
+
+    if (webClients && webClients.has(webClientId)) {
+        const client = webClients.get(webClientId);
+        if (!client || client.currentDevice !== deviceId) {
+            console.log(`[WebRTC] 拦截未授权 Answer：客户端 ${webClientId} 未选择设备 ${deviceId}`);
+            return;
+        }
+    } else if (conn.allowedViewers && conn.allowedViewers.size > 0 && !conn.allowedViewers.has(webClientId)) {
+        console.log(`[WebRTC] 拦截未授权 Answer：客户端 ${webClientId} 不在允许的观看者列表中`);
         return;
     }
 
@@ -182,26 +202,45 @@ function handleIceCandidate(fromId, msg, consoleClients, webClients) {
     const conn = pendingConnections.get(deviceId);
 
     if (from === 'console') {
-        // 来自控制台，转发给 Web 客户端
-        if (conn && conn.webWs && conn.webWs.readyState === 1) {
-            conn.webWs.send(JSON.stringify({
-                type: 'webrtc-ice-candidate',
-                deviceId,
-                candidate
-            }));
-        } else {
-            // 缓存 candidate
-            if (conn) {
-                conn.candidates.push(candidate);
-                console.log(`[WebRTC] Web 客户端未连接，缓存 ICE candidate (共 ${conn.candidates.length} 个)`);
-            }
+        // 校验来自控制台的 candidate 必须与设备所属控制台严格一致
+        if (!deviceId.startsWith(`${fromId}:`)) {
+            console.log(`[WebRTC] 拦截非法 ICE candidate：控制台 ${fromId} 不拥有设备 ${deviceId}`);
+            return;
+        }
+
+        // 来自控制台，转发给该设备的所有合法 Web 观看者
+        let sent = false;
+        if (webClients) {
+            webClients.forEach((client) => {
+                if (client.currentDevice === deviceId && client.ws && client.ws.readyState === 1) {
+                    client.ws.send(JSON.stringify({
+                        type: 'webrtc-ice-candidate',
+                        deviceId,
+                        candidate
+                    }));
+                    sent = true;
+                }
+            });
+        }
+        if (!sent && conn) {
+            conn.candidates.push(candidate);
+            console.log(`[WebRTC] Web 客户端未连接，缓存 ICE candidate (共 ${conn.candidates.length} 个)`);
         }
     } else if (from === 'web') {
-        // 来自 Web 客户端，转发给控制台
-        const [consoleId] = deviceId.split(':');
-        const consoleClient = consoleClients.get(consoleId);
+        // 校验来自 Web 端的 candidate，发送者必须当前正选看该设备
+        if (webClients && webClients.has(fromId)) {
+            const client = webClients.get(fromId);
+            if (!client || client.currentDevice !== deviceId) {
+                console.log(`[WebRTC] 拦截非法 ICE candidate：Web 客户端 ${fromId} 未选看设备 ${deviceId}`);
+                return;
+            }
+        }
 
-        if (consoleClient && consoleClient.ws.readyState === 1) {
+        // 转发给控制台
+        const [consoleId] = deviceId.split(':');
+        const consoleClient = consoleClients ? consoleClients.get(consoleId) : null;
+
+        if (consoleClient && consoleClient.ws && consoleClient.ws.readyState === 1) {
             consoleClient.ws.send(JSON.stringify({
                 type: 'webrtc-ice-candidate',
                 deviceId,

@@ -1498,7 +1498,17 @@ function sendControl(action) {
         return;
     }
 
-    console.warn('[CONTROL] P2P 通道未就绪，已丢弃控制指令:', action);
+    // 回退到 WebSocket 下发控制指令
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'control',
+            action: action,
+            deviceId: currentDevice
+        }));
+        return;
+    }
+
+    console.warn('[CONTROL] 控制通道未就绪，已丢弃控制指令:', action);
 }
 
 // 断开连接
@@ -1569,9 +1579,20 @@ function showError(message) {
 }
 
 // 登出
-function logout() {
+async function logout() {
+    try {
+        await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch (e) {
+        console.error('Logout error:', e);
+    }
     localStorage.removeItem('token');
     localStorage.removeItem('username');
+    if (ws) {
+        try { ws.close(); } catch (_) {}
+    }
+    if (peerConnection) {
+        try { peerConnection.close(); } catch (_) {}
+    }
     window.location.href = '/login.html';
 }
 
@@ -1681,11 +1702,27 @@ function sendTouchEvent(action, x, y) {
         return;
     }
 
+    // 回退到 WebSocket 下发触控指令
+    if (ws && ws.readyState === WebSocket.OPEN && currentDevice) {
+        ws.send(JSON.stringify({
+            type: 'touch',
+            action: action,
+            x: x,
+            y: y,
+            width: canvas.width,
+            height: canvas.height
+        }));
+        if (action !== 'move') {
+            console.log(`[TOUCH][WS] ${action} (${x}, ${y})`);
+        }
+        return;
+    }
+
     // 触摸 move 非常高频，避免刷屏，每 2 秒最多打印一次
     const now = performance.now();
     if (now - lastTouchDropLogTime > 2000) {
         lastTouchDropLogTime = now;
-        console.warn('[TOUCH] P2P 通道未就绪，触摸事件已丢弃');
+        console.warn('[TOUCH] 控制通道未就绪，触摸事件已丢弃');
     }
 }
 
