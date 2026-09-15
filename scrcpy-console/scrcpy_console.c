@@ -30,9 +30,10 @@ extern const GUID GUID_WICPixelFormat24bppBGR;
 */
 
 #define BUFFER_SIZE 8192
-#define WS_RECV_BUFFER_SIZE (1024 * 256) // 256KB WebSocket 接收缓冲区
 #define MAX_DEVICES 32
 #define MAX_WS_PAYLOAD_SIZE (1024 * 1024) // 1MB 最大 WebSocket 消息
+// 接收缓冲区必须 ≥ 单帧上限,否则大帧永远凑不齐、反复触发"溢出重置"导致流失步
+#define WS_RECV_BUFFER_SIZE (MAX_WS_PAYLOAD_SIZE + 16)
 #define VERSION "1.2.0"
 #define MAX_RECONNECT_ATTEMPTS 10
 #define RECONNECT_BASE_DELAY 1000 // 初始重连延迟 1 秒
@@ -134,6 +135,9 @@ char client_id[64] = {0};
 Device devices[MAX_DEVICES];
 int device_count = 0;
 bool running = true;
+// 连接代次：每次成功建立 WS 连接递增；缩略图线程以此感知断线并在代次变化时退出，
+// 修复"每次断线重连泄漏一个缩略图线程"的问题
+volatile ULONG g_connection_generation = 0;
 char server_url[256] = "localhost:8080";
 char console_token[256] = {0};
 static volatile LONG g_start_device_in_progress = 0;
@@ -278,6 +282,8 @@ int main(int argc, char* argv[]) {
         free(ws_recv_buffer);
         CoUninitialize();
         DeleteCriticalSection(&thumbnail_cs);
+        DeleteCriticalSection(&devices_cs);
+        DeleteCriticalSection(&ws_send_cs);
         return 1;
     }
 
@@ -348,7 +354,8 @@ int main(int argc, char* argv[]) {
         send_device_list();
         last_thumbnail_update = GetTickCount();
         
-        // 启动缩略图更新线程
+        // 启动缩略图更新线程（先递增连接代次，使上一代旧线程在下次循环检查时自行退出）
+        g_connection_generation++;
         thumbnail_thread = (HANDLE)_beginthreadex(NULL, 0, thumbnail_update_thread, NULL, 0, NULL);
 
         // 进入主循环（会在连接断开时返回）
@@ -442,11 +449,12 @@ bool connect_to_server() {
     char* colon = strchr(server_url, ':');
     if (colon) {
         int host_len = colon - server_url;
+        if (host_len >= (int)sizeof(host)) host_len = sizeof(host) - 1;
         strncpy(host, server_url, host_len);
         host[host_len] = '\0';
-        strcpy(port, colon + 1);
+        snprintf(port, sizeof(port), "%s", colon + 1);
     } else {
-        strcpy(host, server_url);
+        snprintf(host, sizeof(host), "%s", server_url);
         strcpy(port, "8080");
     }
     
@@ -495,14 +503,21 @@ bool connect_to_server() {
             host);
     }
     
-    send(ws_socket, handshake, strlen(handshake), 0);
-    
+    if (send(ws_socket, handshake, (int)strlen(handshake), 0) == SOCKET_ERROR) {
+        print_log("ERROR", "握手发送失败: %d", WSAGetLastError());
+        closesocket(ws_socket);
+        ws_socket = INVALID_SOCKET;
+        return false;
+    }
+
     // 接收握手响应（持续读取直到找到 HTTP 头结束符 \r\n\r\n，并保留后续伴随的 WebSocket 数据）
     char response[2048];
     int total_recvd = 0;
     while (total_recvd < (int)sizeof(response) - 1) {
         int n = recv(ws_socket, response + total_recvd, sizeof(response) - 1 - total_recvd, 0);
         if (n <= 0) {
+            closesocket(ws_socket);
+            ws_socket = INVALID_SOCKET;
             return false;
         }
         total_recvd += n;
@@ -510,6 +525,8 @@ bool connect_to_server() {
         char* header_end = strstr(response, "\r\n\r\n");
         if (header_end) {
             if (strstr(response, "101 Switching Protocols") == NULL) {
+                closesocket(ws_socket);
+                ws_socket = INVALID_SOCKET;
                 return false;
             }
             int header_len = (int)((header_end + 4) - response);
@@ -1173,7 +1190,8 @@ void send_device_list() {
     LeaveCriticalSection(&devices_cs);
 
     // 发送完整设备列表快照，确保服务端可清理已下线设备
-    size_t list_capacity = total_devices * 1024 + 1024;
+    // 每设备预算 2048：serial/customName/model 各最长 255+ JSON 转义最坏 ~1360B/设备，留足余量
+    size_t list_capacity = total_devices * 2048 + 1024;
     if (list_capacity < BUFFER_SIZE * 2) {
         list_capacity = BUFFER_SIZE * 2;
     }
@@ -1244,11 +1262,14 @@ void send_device_list_async() {
 unsigned __stdcall thumbnail_update_thread(void* param) {
     // 为线程初始化COM环境
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    
+
     // 避免未使用参数警告
     (void)param;
-    
-    while (running) {
+
+    // 记录所属连接代次：断线重连后代次变化，旧线程自行退出
+    const ULONG my_generation = g_connection_generation;
+
+    while (running && g_connection_generation == my_generation) {
         if (InterlockedCompareExchange(&g_start_device_in_progress, 0, 0) == 1) {
             Sleep(200);
             continue;
@@ -1266,7 +1287,11 @@ unsigned __stdcall thumbnail_update_thread(void* param) {
         if (should_update && device_count > 0) {
             // 限制并行线程数量，避免对系统造成过大压力
             const int MAX_CONCURRENT_THREADS = 8;  // 最多同时处理8个设备
+            // devices_cs 内快照设备数，避免与主线程的设备列表更新竞态
+            EnterCriticalSection(&devices_cs);
             const int total_devices = device_count;
+            LeaveCriticalSection(&devices_cs);
+            if (total_devices <= 0) continue;
             
             // 并行获取所有设备的缩略图
             if (total_devices > 1) {
@@ -1515,21 +1540,25 @@ void handle_server_message(const char* message) {
 
                 // 校验设备是否存在于当前扫描列表中（必要时先重扫一次）
                 int device_index = -1;
+                EnterCriticalSection(&devices_cs);
                 for (int i = 0; i < device_count; i++) {
                     if (strcmp(devices[i].serial, serial) == 0) {
                         device_index = i;
                         break;
                     }
                 }
+                LeaveCriticalSection(&devices_cs);
                 if (device_index < 0) {
                     int refreshed_count = scan_adb_devices();
                     if (refreshed_count > 0) {
+                        EnterCriticalSection(&devices_cs);
                         for (int i = 0; i < device_count; i++) {
                             if (strcmp(devices[i].serial, serial) == 0) {
                                 device_index = i;
                                 break;
                             }
                         }
+                        LeaveCriticalSection(&devices_cs);
                     }
                 }
                 if (device_index < 0) {
@@ -1901,12 +1930,14 @@ void handle_server_message(const char* message) {
                 print_log("INFO", "更新设备名称: %s -> %s", serial, custom_name);
                 
                 // 只更新内存中的设备名称，不再保存到文件
+                EnterCriticalSection(&devices_cs);
                 for (int i = 0; i < device_count; i++) {
                     if (strcmp(devices[i].serial, serial) == 0) {
                         strncpy(devices[i].custom_name, custom_name, sizeof(devices[i].custom_name) - 1);
                         break;
                     }
                 }
+                LeaveCriticalSection(&devices_cs);
                 
                 // 重新发送设备列表
                 send_device_list();
@@ -1927,6 +1958,7 @@ void handle_server_message(const char* message) {
             if (device_id_end) {
                 char device_id[256];
                 int len = device_id_end - device_id_start;
+                if (len >= (int)sizeof(device_id)) len = sizeof(device_id) - 1; // 边界钳制,防远程溢出
                 strncpy(device_id, device_id_start, len);
                 device_id[len] = '\0';
 
@@ -1997,6 +2029,7 @@ void handle_server_message(const char* message) {
             if (device_id_end) {
                 char device_id[256];
                 int len = device_id_end - device_id_start;
+                if (len >= (int)sizeof(device_id)) len = sizeof(device_id) - 1; // 边界钳制,防远程溢出
                 strncpy(device_id, device_id_start, len);
                 device_id[len] = '\0';
 
@@ -2008,6 +2041,7 @@ void handle_server_message(const char* message) {
                     if (cand_end) {
                         char candidate[512];
                         int clen = cand_end - cand_value_start;
+                        if (clen >= (int)sizeof(candidate)) clen = sizeof(candidate) - 1; // 边界钳制,防远程溢出
                         strncpy(candidate, cand_value_start, clen);
                         candidate[clen] = '\0';
 
@@ -2083,10 +2117,8 @@ void stop_all_devices() {
     for (int i = 0; i < count; i++) {
         stop_device(serials[i]);
     }
-    
-    // 强制终止所有scrcpy进程（额外保障）
-    print_log("INFO", "正在强制终止所有scrcpy进程...");
-    system("taskkill /F /IM scrcpy.exe /T >nul 2>nul");
+    // 仅终止本程序记录在册的 scrcpy 进程（按 pid），不再全系统 taskkill
+    // 误杀用户手工开启的、与本程序无关的 scrcpy 会话
 }
 
 static void process_ws_recv_buffer(void) {

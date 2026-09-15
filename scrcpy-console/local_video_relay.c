@@ -777,6 +777,14 @@ static unsigned __stdcall local_server_listener(void* param) {
                         conn_type == WS_CONN_CONTROL ? "control" : "video");
 
                     LocalScrcpyClient* client = find_local_client(serial);
+
+                    // 连接类型必须先校验再占用槽位，防止未知类型握手泄漏槽位
+                    if (conn_type == WS_CONN_UNKNOWN) {
+                        print_log("WARN", "[LocalRelay] 未知连接类型，拒绝: %s", serial);
+                        closesocket(client_sock);
+                        continue;
+                    }
+
                     if (!client) {
                         client = create_local_client(serial);
                     }
@@ -787,19 +795,17 @@ static unsigned __stdcall local_server_listener(void* param) {
                         continue;
                     }
 
-                    if (conn_type == WS_CONN_UNKNOWN) {
-                        print_log("WARN", "[LocalRelay] 未知连接类型，拒绝: %s", serial);
-                        closesocket(client_sock);
-                        continue;
-                    }
-
                     if (conn_type == WS_CONN_CONTROL) {
                         close_control_socket_locked(client);
                         client->control_socket = client_sock;
                         print_log("INFO", "[LocalRelay] 控制连接已建立: %s", serial);
                     } else {
+                        // 同 serial 视频重连：先 shutdown 唤醒可能阻塞在旧 socket
+                        // recv 上的转发线程，再 close（跨线程 closesocket+句柄复用是 UB）
                         if (client->video_socket != INVALID_SOCKET) {
+                            shutdown(client->video_socket, SD_BOTH);
                             closesocket(client->video_socket);
+                            client->video_socket = INVALID_SOCKET;
                         }
                         client->video_socket = client_sock;
                         client->first_frame_seen = false;
@@ -830,6 +836,12 @@ static unsigned __stdcall local_server_listener(void* param) {
 
 // 初始化本地服务器
 bool init_local_video_relay() {
+    // 防重入：上一次 stop 未完全收尾（监听线程仍存活）时拒绝重 init，
+    // 防止双线程同时 accept 同一监听 socket
+    if (local_server_thread != NULL) {
+        print_log("ERROR", "[LocalRelay] 上一监听线程尚未退出，拒绝重复初始化");
+        return false;
+    }
     // Winsock 已在主程序初始化，无需重复调用 WSAStartup
     if (!g_control_send_cs_ready) {
         InitializeCriticalSection(&g_control_send_cs);
@@ -921,9 +933,11 @@ bool init_local_video_relay() {
 void stop_local_video_relay() {
     local_server_running = false;
 
-    // 关闭所有客户端连接（控制连接持锁关闭，避免与帧发送并发）
+    // 关闭所有客户端连接。先 shutdown 唤醒阻塞在 recv 上的转发线程再 close，
+    // 避免他线程 closesocket 阻塞 socket 的未定义行为与句柄复用串台
     for (int i = 0; i < local_client_count; i++) {
         if (local_clients[i].video_socket != INVALID_SOCKET) {
+            shutdown(local_clients[i].video_socket, SD_BOTH);
             closesocket(local_clients[i].video_socket);
             local_clients[i].video_socket = INVALID_SOCKET;
         }
@@ -938,7 +952,11 @@ void stop_local_video_relay() {
     local_server_port = 0;
 
     if (local_server_thread) {
-        WaitForSingleObject(local_server_thread, 1000);
+        // 监听线程最长可能阻塞在 1.5s 的握手里，等足 3s 防止僵尸监听线程
+        DWORD wait_result = WaitForSingleObject(local_server_thread, 3000);
+        if (wait_result == WAIT_TIMEOUT) {
+            print_log("ERROR", "[LocalRelay] 监听线程 3s 未退出，存在僵尸线程风险");
+        }
         CloseHandle(local_server_thread);
         local_server_thread = NULL;
     }
@@ -987,6 +1005,7 @@ void close_local_client(const char* serial) {
     LocalScrcpyClient* client = find_local_client(serial);
     if (client) {
         if (client->video_socket != INVALID_SOCKET) {
+            shutdown(client->video_socket, SD_BOTH);
             closesocket(client->video_socket);
             client->video_socket = INVALID_SOCKET;
         }

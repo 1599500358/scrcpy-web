@@ -56,7 +56,7 @@ echo ""
 OUTPUT="scrcpy-console.exe"
 SOURCES="scrcpy_console.c"
 LIBS="-lws2_32 -lwindowscodecs -lole32 -loleaut32 -ladvapi32"
-CFLAGS="-O2 -Wall -Wextra -D_WIN32_WINNT=0x0600"
+CFLAGS="-O2 -Wall -Wextra -D_WIN32_WINNT=0x0600 -fstack-protector-strong"
 LINKER="$CC"  # 默认使用 CC 进行链接
 
 # WebRTC 支持
