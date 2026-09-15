@@ -1,5 +1,7 @@
 # scrcpy-web 全系统代码审计报告
 
+> **修复状态(2026-09-15 当日)**:本报告全部服务端发现(P1-1/P1-2/P2-3~7/P3-8~11)与 C 端发现(C-P0、C-P1-2/3 的 shutdown 顺序缓解、C-P2-5/7/8/9、C-P3-10~13)已修复并上线,见提交 `0c5baa8`、`bd99a64`、`4232c80`。**未修复/部分修复**:C-P1-3 的线程代次完整方案、C-P1-4(需与定制 scrcpy 构建协同下发一次性令牌)、C-P2-6(连接表读写锁重构)——均涉及跨进程/线程架构级改动,已记录待办。CONSOLE_TOKEN 已在服务端启用,**Windows 控制台须设置 `CONSOLE_TOKEN` 环境变量或以第二参数传入后重启,否则无法连接**。
+
 - 日期:2026-09-15
 - 范围:relay-server(Node.js)、scrcpy-console(Windows C 客户端)、部署面(Caddy / pm2 / Cloudflare Worker 中继)
 - 方法:全量人工通读服务端约 6000 行 JS + C 端约 4400 行 C;对照既有审计报告(client-backend-communication-audit-2026-09-15.md、scrcpy-console-device-audit-report.md)查漏与验证修复落实
