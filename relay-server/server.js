@@ -103,6 +103,10 @@ if (ENABLE_HTTPS) {
         if (req.headers.upgrade === 'websocket') {
             return next();
         }
+        // HTTP/1.0 请求(扫描器)可能不带 Host 头,直接拒绝而非让 redirect 代码抛 TypeError
+        if (!req.headers.host) {
+            return res.status(400).end('Bad Request');
+        }
         // 否则重定向到 HTTPS
         const httpsUrl = `https://${req.headers.host.split(':')[0]}:${HTTPS_PORT}${req.url}`;
         res.redirect(301, httpsUrl);
@@ -286,14 +290,16 @@ app.use(sessionMiddleware);
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// 认证相关端点 per-IP 限速（防刷登录/OAuth 回调；正常一次登录仅产生 2 次请求）
+// 认证相关端点 per-IP 限速（防刷登录/OAuth 回调；正常一次登录仅产生 2 次请求）。
+// 注意：必须挂在具体路由上而非 app.use 前缀——/api/auth/google 前缀会误伤
+// 登录页每次都要请求的 /api/auth/google/status
 const isAuthEndpointThrottled = createRateLimiter();
-app.use(['/api/login', '/api/auth/google', '/api/auth/google/callback'], (req, res, next) => {
+function authRateLimit(req, res, next) {
     if (isAuthEndpointThrottled(`auth:${req.ip}`, 10000)) {
         return res.status(429).json({ success: false, error: '请求过于频繁，请稍后重试' });
     }
     next();
-});
+}
 
 // 认证检查中间件
 function checkAuth(req, res, next) {
@@ -314,7 +320,7 @@ app.get('/login', (req, res) => {
 });
 
 // 登录API
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authRateLimit, async (req, res) => {
     if (!PASSWORD_LOGIN) {
         return res.status(403).json({ success: false, message: '密码登录已禁用，请使用 Google 登录' });
     }
@@ -385,7 +391,7 @@ app.get('/api/auth/google/status', (req, res) => {
 });
 
 // 发起 Google 登录：生成 state + PKCE 暂存到会话后跳转 Google
-app.get('/api/auth/google', (req, res) => {
+app.get('/api/auth/google', authRateLimit, (req, res) => {
     const cfg = googleAuth.getGoogleOAuthConfig();
     if (!googleAuth.isGoogleOAuthConfigured()) {
         return res.redirect('/login?error=' + encodeURIComponent('Google 登录未配置：缺少 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / ADMIN_EMAIL'));
@@ -405,7 +411,7 @@ app.get('/api/auth/google', (req, res) => {
 });
 
 // Google 回调：校验 state → 兑换 token → 拉取用户信息 → 白名单校验 → 写入会话
-app.get('/api/auth/google/callback', async (req, res) => {
+app.get('/api/auth/google/callback', authRateLimit, async (req, res) => {
     const cfg = googleAuth.getGoogleOAuthConfig();
     const oauth = req.session && req.session.oauth;
     delete req.session.oauth;
