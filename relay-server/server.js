@@ -42,6 +42,9 @@ const TURN_SECRET = process.env.TURN_SECRET || ''; // 用于生成临时凭证
 // 日志级别控制
 const log = makeLog(process.env.LOG_LEVEL || 'INFO');
 
+// WebRTC 信令模块复用统一日志门控（其内部不再绕过 LOG_LEVEL 直出 console.log）
+WebRTC.setLogger(log);
+
 // 控制台认证 Token（可选配置，未配置时输出提示）
 const CONSOLE_TOKEN = process.env.CONSOLE_TOKEN || '';
 if (CONSOLE_TOKEN) {
@@ -171,15 +174,15 @@ function revokeWebClientsBySessionId(sessionId) {
 const deviceAliases = new Map();
 const deviceGroups = new Map();
 
-// 加载设备别名
+// 加载设备别名（保留全部历史键：含旧版纯 serial 键，避免加载即丢、保存时抹除）
 function loadDeviceAliases() {
     try {
         if (fs.existsSync('device_aliases.json')) {
             const data = fs.readFileSync('device_aliases.json', 'utf8');
             const aliases = JSON.parse(data);
             for (const [key, value] of Object.entries(aliases)) {
-                if (key.includes(':')) {
-                    deviceAliases.set(key, value);
+                if (typeof value === 'string' && value.trim()) {
+                    deviceAliases.set(key, value.trim());
                 }
             }
             console.log(`[设备别名] 已加载 ${deviceAliases.size} 个设备别名`);
@@ -197,9 +200,7 @@ function saveDeviceAliases() {
         try {
             const aliases = {};
             deviceAliases.forEach((value, key) => {
-                if (key.includes(':')) {
-                    aliases[key] = value;
-                }
+                aliases[key] = value;
             });
             fs.writeFileSync('device_aliases.json', JSON.stringify(aliases, null, 2));
             log('INFO', '[设备别名] 设备别名已保存');
@@ -284,6 +285,15 @@ app.use(sessionMiddleware);
 // 解析请求体
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+// 认证相关端点 per-IP 限速（防刷登录/OAuth 回调；正常一次登录仅产生 2 次请求）
+const isAuthEndpointThrottled = createRateLimiter();
+app.use(['/api/login', '/api/auth/google', '/api/auth/google/callback'], (req, res, next) => {
+    if (isAuthEndpointThrottled(`auth:${req.ip}`, 10000)) {
+        return res.status(429).json({ success: false, error: '请求过于频繁，请稍后重试' });
+    }
+    next();
+});
 
 // 认证检查中间件
 function checkAuth(req, res, next) {
@@ -512,16 +522,6 @@ app.use(express.static(path.join(__dirname, 'public'), {
     index: false
 }));
 
-// 检查是否为已登录用户的中间件（用于静态文件）
-function checkAuthStatic(req, res, next) {
-    if (req.session && req.session.user) {
-        next();
-    } else {
-        // 未登录，重定向到登录页
-        res.redirect('/login');
-    }
-}
-
 // 需要认证的特定路由
 // 主页路由（需要认证）
 app.get('/', checkAuth, (req, res) => {
@@ -544,29 +544,45 @@ app.post('/api/prepare-device-stream', (req, res) => {
         });
     }
 
-    // 验证控制台 Token 或 管理端会话
+    // 验证控制台身份：优先控制台 Token；未配置 Token 时要求 Web 管理端会话
+    // （修复：旧逻辑在未配置 CONSOLE_TOKEN 时对匿名请求完全放行）
     const headerToken = req.headers['x-console-token'];
     const authHeader = req.headers['authorization'];
     const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
     const providedToken = token || headerToken || bearerToken || req.query.token;
+    const hasWebSession = !!(req.session && req.session.user);
 
-    if (CONSOLE_TOKEN && providedToken !== CONSOLE_TOKEN && (!req.session || !req.session.user)) {
+    if (CONSOLE_TOKEN) {
+        if (providedToken !== CONSOLE_TOKEN && !hasWebSession) {
+            return res.status(401).json({
+                success: false,
+                message: '控制台 Token 认证失败'
+            });
+        }
+    } else if (!hasWebSession) {
         return res.status(401).json({
             success: false,
-            message: '控制台 Token 认证失败'
+            message: '未配置 CONSOLE_TOKEN 且无有效会话，拒绝匿名预注册'
         });
     }
-    
+
     // 验证控制台是否存在
     if (!consoleClients.has(consoleId)) {
-        return res.status(404).json({ 
-            success: false, 
-            message: '控制台不存在' 
+        return res.status(404).json({
+            success: false,
+            message: '控制台不存在'
         });
     }
-    
-    // 生成短期单次票据
-    const { ticket, streamSessionId } = streamTickets.create(consoleId, serial);
+
+    // 生成短期单次票据（超过容量上限时拒绝，防内存 DoS）
+    const created = streamTickets.create(consoleId, serial);
+    if (!created) {
+        return res.status(503).json({
+            success: false,
+            message: '推流票据数量已达上限，请稍后重试'
+        });
+    }
+    const { ticket, streamSessionId } = created;
     log('INFO', `[预注册] 控制台${consoleId}预注册设备${serial}的推流, ticket=${ticket}`);
     
     res.json({ 
@@ -969,56 +985,6 @@ function continueWebSocketConnection(ws, req, params, clientType, user, explicit
             }
         });
         
-    } else if (clientType === 'device') {
-        // scrcpy 设备视频流连接（兼容格式）
-        const serial = params.get('serial');
-        const consoleId = params.get('consoleId');
-        
-        if (!serial || !consoleId) {
-            log('WARN', '[设备] 连接被拒绝: 缺少 serial 或 consoleId');
-            ws.close();
-            return;
-        }
-        
-        const consoleClient = consoleClients.get(consoleId);
-        if (!consoleClient) {
-            log('WARN', `[设备] 连接被拒绝: 控制台 ${consoleId} 不存在`);
-            ws.close();
-            return;
-        }
-        
-        const device = consoleClient.devices.get(serial);
-        if (device) {
-            device.videoWs = ws;
-            device.status = 'streaming';
-            log('INFO', `[设备] ${serial} 视频流已连接`);
-            
-            // 通知控制台
-            consoleClient.ws.send(JSON.stringify({
-                type: 'deviceStreamingStarted',
-                serial: serial
-            }));
-        }
-        
-        ws.on('message', (data) => {
-            webClients.forEach((client) => {
-                if (client.currentDevice === `${consoleId}:${serial}` && 
-                    client.ws.readyState === WebSocket.OPEN) {
-                    if (client.ws.bufferedAmount <= MAX_WS_BUFFERED_AMOUNT) {
-                        client.ws.send(data, { binary: true, compress: false });
-                    }
-                }
-            });
-        });
-        
-        ws.on('close', () => {
-            if (device && device.videoWs === ws) {
-                device.videoWs = null;
-                device.status = 'ready';
-                log('INFO', `[设备] ${serial} 视频流已断开`);
-            }
-        });
-        
     } else if (clientType === 'web') {
         // Web 浏览器客户端连接
         const clientId = `web_${crypto.randomUUID()}`;
@@ -1088,7 +1054,7 @@ function handleConsoleMessage(consoleId, msg) {
             msg.devices.forEach((incomingDevice) => {
                 const oldDevice = oldDevices.get(incomingDevice.serial);
                 const devKey = `${consoleId}:${incomingDevice.serial}`;
-                const aliasName = deviceAliases.get(devKey);
+                const aliasName = deviceAliases.get(devKey) || deviceAliases.get(incomingDevice.serial);
                 const preservedName = aliasName || oldDevice?.customName || incomingDevice.customName;
                 const preservedGroup = deviceGroups.get(devKey) || oldDevice?.groupName || incomingDevice.groupName || '';
 
@@ -1128,7 +1094,7 @@ function handleConsoleMessage(consoleId, msg) {
                 const incomingDevice = msg.device;
                 const oldDevice = consoleClient.devices.get(incomingDevice.serial);
                 const devKey = `${consoleId}:${incomingDevice.serial}`;
-                const aliasName = deviceAliases.get(devKey);
+                const aliasName = deviceAliases.get(devKey) || deviceAliases.get(incomingDevice.serial);
                 const preservedName = aliasName || oldDevice?.customName || incomingDevice.customName;
                 const preservedGroup = deviceGroups.get(devKey) || oldDevice?.groupName || incomingDevice.groupName || '';
 
@@ -1198,7 +1164,19 @@ function handleConsoleMessage(consoleId, msg) {
             // 控制台预注册设备推流
             const prepareSerial = msg.serial;
             if (prepareSerial) {
-                const { ticket, streamSessionId } = streamTickets.create(consoleId, prepareSerial);
+                const createdTicket = streamTickets.create(consoleId, prepareSerial);
+                if (!createdTicket) {
+                    log('WARN', `[控制台] ${consoleId} 预注册失败: 票据已达上限`);
+                    sendWsJson(consoleClient.ws, {
+                        type: 'prepareStreamResponse',
+                        serial: prepareSerial,
+                        consoleId,
+                        success: false,
+                        message: '推流票据数量已达上限'
+                    });
+                    break;
+                }
+                const { ticket, streamSessionId } = createdTicket;
                 log('INFO', `[控制台] ${consoleId} 预注册设备推流: ${prepareSerial}, ticket=${ticket}`);
 
                 // 回复确认

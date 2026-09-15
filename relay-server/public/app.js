@@ -1365,7 +1365,14 @@ function updateDeviceList(devices) {
 
         const groupTitle = document.createElement('div');
         groupTitle.className = 'device-group-title';
-        groupTitle.innerHTML = `<span>${groupName}</span><span class="device-group-count">${devicesInGroup.length} 台</span>`;
+        // 分组名来自用户输入，必须走 textContent 防存储型 XSS
+        const groupNameSpan = document.createElement('span');
+        groupNameSpan.textContent = groupName;
+        const countSpan = document.createElement('span');
+        countSpan.className = 'device-group-count';
+        countSpan.textContent = `${devicesInGroup.length} 台`;
+        groupTitle.appendChild(groupNameSpan);
+        groupTitle.appendChild(countSpan);
 
         const groupList = document.createElement('ul');
         groupList.className = 'device-group-list';
@@ -1382,7 +1389,9 @@ function updateDeviceList(devices) {
 // 更新单个设备信息
 function updateSingleDevice(device) {
     const deviceList = document.getElementById('deviceList');
-    const li = deviceList.querySelector(`li[data-device-id="${device.consoleId}:${device.serial}"]`);
+    // serial 为外部输入，转义引号与反斜杠防止破坏选择器
+    const safeDeviceId = `${device.consoleId}:${device.serial}`.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const li = deviceList.querySelector(`li[data-device-id="${safeDeviceId}"]`);
     
     if (!li) return;
     

@@ -162,11 +162,28 @@ function isAllowedWsOrigin(req) {
  * 设备推流票据注册表。票据供 scrcpy 的 video/control 两条 WebSocket
  * 连接各消费一次，超时（默认 60 秒）或双双消费后删除。
  * now/ticketLifetimeMs 可注入，便于单测过期路径。
+ *
+ * 内存安全：create 时惰性清扫过期票据并强制容量上限（默认 1000），
+ * 超限时 create 返回 null（未消费的票据不会无限堆积导致 OOM）。
  */
-function createStreamTicketRegistry({ now = Date.now, ticketLifetimeMs = 60000 } = {}) {
+function createStreamTicketRegistry({ now = Date.now, ticketLifetimeMs = 60000, maxTickets = 1000 } = {}) {
     const tickets = new Map();
 
+    // 删除全部已过期但从未被消费的票据（consume 只在访问时清理自身）
+    function sweep() {
+        const t = now();
+        tickets.forEach((entry, key) => {
+            if (t - entry.createdAt > ticketLifetimeMs) {
+                tickets.delete(key);
+            }
+        });
+    }
+
     function create(consoleId, serial) {
+        sweep();
+        if (tickets.size >= maxTickets) {
+            return null;
+        }
         const ticket = crypto.randomBytes(24).toString('hex');
         const streamSessionId = crypto.randomUUID();
         tickets.set(ticket, {
@@ -330,6 +347,9 @@ function buildWebDeviceList(consoleClients, deviceAliases, deviceGroups, log = (
 
             if (deviceAliases.has(deviceId)) {
                 deviceInfo.customName = deviceAliases.get(deviceId);
+            } else if (deviceAliases.has(serial)) {
+                // 兼容旧版纯 serial 键的别名
+                deviceInfo.customName = deviceAliases.get(serial);
             } else if (device.customName) {
                 deviceInfo.customName = device.customName;
             }

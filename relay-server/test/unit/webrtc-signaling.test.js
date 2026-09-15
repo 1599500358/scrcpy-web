@@ -246,25 +246,6 @@ describe('handleIceCandidate', () => {
     });
 });
 
-describe('handleWebSelectDevice', () => {
-    test('有缓存 Offer 时立即发给新观看者并更新 webWs', () => {
-        const webWs = makeWs();
-        const offer = { type: 'offer', sdp: 'v=0' };
-        WebRTC.pendingConnections.set('c1:d1', {
-            consoleId: 'c1', consoleWs: makeWs(), offer, candidates: [], allowedViewers: new Set(), webWs: null, answer: null
-        });
-        WebRTC.handleWebSelectDevice('w1', 'c1:d1', webWs, new Map());
-        assert.deepStrictEqual(webWs.sent[0], { type: 'webrtc-offer', deviceId: 'c1:d1', sdp: offer, consoleId: 'c1' });
-        assert.strictEqual(WebRTC.pendingConnections.get('c1:d1').webWs, webWs);
-    });
-
-    test('无待处理连接时不发送', () => {
-        const webWs = makeWs();
-        WebRTC.handleWebSelectDevice('w1', 'c9:none', webWs, new Map());
-        assert.strictEqual(webWs.sent.length, 0);
-    });
-});
-
 describe('cleanupConnection', () => {
     test('清理已存在设备的连接信息', () => {
         WebRTC.pendingConnections.set('c1:d1', { offer: {} });

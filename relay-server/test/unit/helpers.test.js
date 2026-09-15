@@ -590,3 +590,49 @@ describe('buildWebDeviceList 设备列表组装', () => {
         );
     });
 });
+
+describe('createStreamTicketRegistry 内存安全（清扫与容量上限）', () => {
+    test('create 时惰性清扫从未消费的过期票据', () => {
+        let nowMs = 1000000;
+        const reg = helpers.createStreamTicketRegistry({ now: () => nowMs });
+        reg.create('c1', 'dev1');
+        reg.create('c1', 'dev2');
+        nowMs += 61000; // 全部过期
+        reg.create('c1', 'dev3'); // 触发惰性清扫
+        assert.strictEqual(reg.size(), 1, '过期票据应在 create 时被清扫');
+    });
+
+    test('达到容量上限后 create 返回 null（调用方须拒绝）', () => {
+        const reg = helpers.createStreamTicketRegistry({ maxTickets: 2 });
+        assert.ok(reg.create('c1', 'dev1'));
+        assert.ok(reg.create('c1', 'dev2'));
+        assert.strictEqual(reg.create('c1', 'dev3'), null);
+        assert.strictEqual(reg.size(), 2);
+    });
+
+    test('清扫后释放容量，可继续创建', () => {
+        let nowMs = 1000000;
+        const reg = helpers.createStreamTicketRegistry({ now: () => nowMs, maxTickets: 2 });
+        reg.create('c1', 'dev1');
+        reg.create('c1', 'dev2');
+        assert.strictEqual(reg.create('c1', 'dev3'), null);
+        nowMs += 61000; // 过期
+        const created = reg.create('c1', 'dev3'); // 清扫腾出空间
+        assert.ok(created, '清扫后应可继续创建');
+        assert.strictEqual(reg.size(), 1);
+    });
+});
+
+describe('buildWebDeviceList 旧版 serial 别名兼容', () => {
+    test('无 deviceId 键时回退匹配纯 serial 键别名', () => {
+        const t = Date.now();
+        const consoles = new Map([
+            ['c1', { ws: { readyState: 1 }, connectedAt: new Date(t).toISOString(), devices: new Map([
+                ['02157df2818ba418', { model: 'A', state: 'device', status: 'ready' }]
+            ])}]
+        ]);
+        const aliases = new Map([['02157df2818ba418', '殷紫萍']]);
+        const list = helpers.buildWebDeviceList(consoles, aliases, new Map());
+        assert.strictEqual(list[0].customName, '殷紫萍');
+    });
+});
